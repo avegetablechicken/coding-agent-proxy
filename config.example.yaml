@@ -1,0 +1,15 @@
+# Copy to config.yaml. Account IDs are tokens.account_id in ~/.codex/auth.json.
+listen_port: 8787
+auth_file: "~/.codex/auth.json"
+upstream_base_url: "https://chatgpt.com/backend-api/codex"
+request_timeout_seconds: 300
+
+# Explicit ports required; http CONNECT, https CONNECT and socks5 supported.
+# Proxy authentication is deliberately unsupported (same as Copool).
+proxies:
+  us: "http://127.0.0.1:8101"
+  jp: "socks5://127.0.0.1:8102"
+
+accounts:
+  "replace-with-us-account-id": us
+  "replace-with-jp-account-id": jp

@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+config.yaml
+*.log
+.DS_Store
+logs/
+*.log.1
+nohup.out
