@@ -326,6 +326,48 @@ curl --noproxy '*' http://127.0.0.1:8787/health
 
 A successful health response confirms only that the listener is alive, not that credentials, mappings, or the upstream service are available.
 
+## OpenAI documentation MCP
+
+The fixed endpoint `/mcp/openaiDeveloperDocs` forwards Streamable HTTP to
+`https://developers.openai.com/mcp`. Merge this into the Codex user configuration
+(use your service's actual port), then restart Codex after starting the updated service:
+
+```toml
+[mcp_servers.openaiDeveloperDocs]
+url = "http://127.0.0.1:7889/mcp/openaiDeveloperDocs"
+enabled = true
+```
+
+No header helper or per-session configuration is required. Without a Bearer
+credential, these requests use the MCP fallback below. If a client supplies a
+Bearer token that uniquely matches a ChatGPT or API Key route, MCP uses that
+route's proxy. Missing/malformed/unknown credentials, unavailable credential
+sources, ambiguous matches, an account mismatch, or a matched account without
+a mapping use `mcp_fallback_proxy` instead. This does not infer credentials from
+the most recent model request or bind MCP to a Codex session.
+
+```yaml
+# Optional top-level field; references a name under proxies.
+mcp_fallback_proxy: jp
+```
+
+Omit the field, set it to null, or use `none` to make the fallback direct.
+An explicitly matched route using `none` also remains direct. The field is
+independent of `openai_fallback_proxy`; unknown MCP tokens never select the
+OpenAI API fallback. An invalid proxy name is a configuration error. Once a
+proxy is selected, connection failures do not retry through another proxy or
+directly. Changes to this field take effect on the next request.
+
+The MCP destination is fixed, not an arbitrary URL forwarder. Model credentials,
+account IDs, cookies and other private request headers are removed before
+contacting the documentation site. MCP session/protocol headers, JSON bodies and
+SSE responses are preserved. Logs include `service: openaiDeveloperDocs`,
+`routing: credential` or `mcp_fallback`, and the selected proxy.
+
+A service used only for public MCP can omit model credential routes; model API
+requests still require configured authentication and routing. Invalid YAML is
+an error for both services, not a reason to use direct access.
+
 ## Multiple proxy services with mihomo and Clash
 
 [mihomo](https://github.com/MetaCubeX/mihomo) is the proxy core used by compatible Clash clients. One core can expose several local proxy services at once, each pinned to a different outbound node. For example:

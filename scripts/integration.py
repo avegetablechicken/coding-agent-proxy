@@ -64,7 +64,9 @@ accounts:
                 staged.replace(config)
             def request(token="token-a", account=None, path="/responses"):
                 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=8)
-                headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+                headers = {"Content-Type": "application/json"}
+                if token is not None:
+                    headers["Authorization"] = "Bearer " + token
                 if account is not None:
                     headers["ChatGPT-Account-Id"] = account
                 conn.request("GET" if path == "/health" else "POST", path, body=b'{"private":"secret-body"}', headers=headers)
@@ -206,6 +208,23 @@ api_key_providers:
                 assert request(token=token, path="/v1/responses")[0] == 502
                 assert len(probe.requests) > count
                 assert probe.requests[-1].startswith(f"CONNECT {host}:443 ".encode())
+                other = b if probe is a else a
+                before, other_before = len(probe.requests), len(other.requests)
+                assert request(token=token, path="/mcp/openaiDeveloperDocs")[0] == 502
+                assert len(probe.requests) > before and len(other.requests) == other_before
+                assert probe.requests[-1].startswith(b"CONNECT developers.openai.com:443 ")
+                assert token.encode() not in probe.requests[-1]
+            config.write_text(config.read_text() + "\nmcp_fallback_proxy: jp\n")
+            for credential in [None, "unknown"]:
+                previous_a, previous_b = len(a.requests), len(b.requests)
+                assert request(token=credential, path="/mcp/openaiDeveloperDocs")[0] == 502
+                assert len(a.requests) == previous_a and len(b.requests) > previous_b
+                assert b.requests[-1].startswith(b"CONNECT developers.openai.com:443 ")
+            config.write_text(config.read_text().replace("mcp_fallback_proxy: jp", "mcp_fallback_proxy: us"))
+            previous_a, previous_b = len(a.requests), len(b.requests)
+            assert request(token=None, path="/mcp/openaiDeveloperDocs")[0] == 502
+            assert len(a.requests) > previous_a and len(b.requests) == previous_b
+            print("PASS: MCP follows matched ChatGPT/API routes, missing credentials use independent hot-reloaded fallback")
             total = len(a.requests) + len(b.requests)
             assert request(token="unknown")[0] == 401
             key_b.write_text("provider-key-one")

@@ -3,12 +3,22 @@ import XCTest
 @testable import RegionProxyCore
 
 private final class FixtureProtocol: URLProtocol, @unchecked Sendable {
-    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "stream-fixture.invalid" }
+    override class func canInit(with request: URLRequest) -> Bool {
+        ["stream-fixture.invalid", "developers.openai.com"].contains(request.url?.host ?? "")
+    }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     private let lock = NSLock()
     private var stopped = false
     override func startLoading() {
-        if request.url?.path.hasPrefix("/v1/") == true {
+        if request.url?.host == "developers.openai.com" {
+            XCTAssertEqual(request.url?.path, "/mcp")
+            XCTAssertEqual(request.url?.query, "test=1")
+            for name in ["Authorization", "ChatGPT-Account-Id", "X-Api-Key", "Api-Key", "Cookie", "X-Private-Token"] {
+                XCTAssertNil(request.value(forHTTPHeaderField: name), "Do not send model credentials to MCP: \(name)")
+            }
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Mcp-Session-Id"), "fixture-session")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Mcp-Protocol-Version"), "2025-03-26")
+        } else if request.url?.path.hasPrefix("/v1/") == true {
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-token")
             XCTAssertNil(request.value(forHTTPHeaderField: "ChatGPT-Account-Id"))
             XCTAssertNil(request.value(forHTTPHeaderField: "X-Api-Key"))
@@ -20,7 +30,7 @@ private final class FixtureProtocol: URLProtocol, @unchecked Sendable {
             XCTAssertEqual(request.value(forHTTPHeaderField: "ChatGPT-Account-Id"), "fixture")
         }
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
-                                       headerFields: ["Content-Type": "text/event-stream", "X-Fixture": "yes"])!
+                                       headerFields: ["Content-Type": "text/event-stream", "X-Fixture": "yes", "Mcp-Session-Id": "returned-session"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data("data: first\n\n".utf8))
         // Keeping the response open makes buffering the entire SSE response observable.
@@ -63,7 +73,29 @@ final class StreamingTests: XCTestCase {
         try await exerciseStreaming(apiKeyMode: true, direct: true)
     }
 
-    private func exerciseStreaming(apiKeyMode: Bool, explicitPath: Bool = false, direct: Bool = false) async throws {
+    func testDocsMCPUsesChatGPTRouteWithoutLeakingCredentials() async throws {
+        try await exerciseStreaming(apiKeyMode: false, mcpMethod: "POST")
+    }
+
+    func testDocsMCPUsesAPIKeyRouteWithoutLeakingCredentials() async throws {
+        try await exerciseStreaming(apiKeyMode: true, mcpMethod: "POST")
+    }
+
+    func testDocsMCPSessionGETAndDELETE() async throws {
+        try await exerciseStreaming(apiKeyMode: false, mcpMethod: "GET")
+        try await exerciseStreaming(apiKeyMode: true, mcpMethod: "DELETE")
+    }
+
+    func testDocsMCPWithoutCredentialDefaultsToDirect() async throws {
+        try await exerciseStreaming(apiKeyMode: false, mcpMethod: "POST", mcpCredential: nil)
+    }
+
+    func testDocsMCPUnknownCredentialUsesConfiguredFallback() async throws {
+        try await exerciseStreaming(apiKeyMode: true, mcpMethod: "POST", mcpCredential: "unknown", mcpFallback: "test")
+    }
+
+    private func exerciseStreaming(apiKeyMode: Bool, explicitPath: Bool = false, direct: Bool = false,
+                                   mcpMethod: String? = nil, mcpCredential: String? = "test-token", mcpFallback: String? = nil) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -106,6 +138,10 @@ final class StreamingTests: XCTestCase {
                 .replacingOccurrences(of: "proxy: test", with: "proxy: none")
                 .write(to: config, atomically: true, encoding: .utf8)
         }
+        if let mcpFallback {
+            try (String(contentsOf: config, encoding: .utf8) + "\nmcp_fallback_proxy: \(mcpFallback)\n")
+                .write(to: config, atomically: true, encoding: .utf8)
+        }
         let logURL = directory.appendingPathComponent("proxy.log")
         let logger = try RequestLogger(fileURL: logURL, console: nil)
         await slot.install(Forwarder(configPath: config.path, port: port, logger: logger, sessionConfiguration: {
@@ -117,23 +153,42 @@ final class StreamingTests: XCTestCase {
         defer { session.invalidateAndCancel() }
         let explicitTarget = apiKeyMode ? "/https://stream-fixture.invalid/v1/models?test=1"
             : "/https://stream-fixture.invalid/backend-api/codex/responses?test=1"
-        let path = explicitPath ? explicitTarget : "/v1/responses?test=1"
+        let path = mcpMethod != nil ? Forwarder.docsMCPPath + "?test=1" : (explicitPath ? explicitTarget : "/v1/responses?test=1")
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
-        request.httpMethod = explicitPath && apiKeyMode ? "GET" : "POST"
+        request.httpMethod = mcpMethod ?? (explicitPath && apiKeyMode ? "GET" : "POST")
         request.httpBody = request.httpMethod == "GET" ? nil : Data("{}".utf8)
         request.setValue("Bearer test-token", forHTTPHeaderField: "Authorization")
         if apiKeyMode {
             request.setValue("wrong-key", forHTTPHeaderField: "X-Api-Key")
             request.setValue("another-key", forHTTPHeaderField: "Api-Key")
             request.setValue("unrelated-account", forHTTPHeaderField: "ChatGPT-Account-Id")
-            var rejected = request
-            rejected.setValue("Bearer incorrect", forHTTPHeaderField: "Authorization")
-            let (_, response) = try await session.data(for: rejected)
-            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 401)
+            if mcpMethod == nil {
+                var rejected = request
+                rejected.setValue("Bearer incorrect", forHTTPHeaderField: "Authorization")
+                let (_, response) = try await session.data(for: rejected)
+                XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 401)
+            }
+        }
+        if mcpMethod != nil {
+            request.setValue(apiKeyMode ? nil : "fixture", forHTTPHeaderField: "ChatGPT-Account-Id")
+            request.setValue("fixture-session", forHTTPHeaderField: "Mcp-Session-Id")
+            request.setValue("2025-03-26", forHTTPHeaderField: "Mcp-Protocol-Version")
+            request.setValue("hidden", forHTTPHeaderField: "X-Private-Token")
+            request.setValue("hidden", forHTTPHeaderField: "Cookie")
+            var unknown = request
+            unknown.url = URL(string: "http://127.0.0.1:\(port)/mcp/unknown")!
+            let (_, response) = try await session.data(for: unknown)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 404)
+            unknown = request
+            unknown.httpMethod = "PUT"
+            let (_, methodResponse) = try await session.data(for: unknown)
+            XCTAssertEqual((methodResponse as? HTTPURLResponse)?.statusCode, 405)
+            request.setValue(mcpCredential.map { "Bearer " + $0 }, forHTTPHeaderField: "Authorization")
         }
         let started = Date()
         let (bytes, response) = try await session.bytes(for: request)
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual((response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Mcp-Session-Id"), "returned-session")
         var result = Data()
         var firstLineAt: TimeInterval?
         for try await byte in bytes {
@@ -153,15 +208,23 @@ final class StreamingTests: XCTestCase {
         let successfulRecords = records.filter { $0["request_id"] == records.last?["request_id"] }
         XCTAssertEqual(successfulRecords.map { $0["event"] }, ["request_received", "route_selected", "upstream_response", "request_finished"])
         XCTAssertEqual(Set(successfulRecords.compactMap { $0["request_id"] }).count, 1)
-        if apiKeyMode {
+        let usesMCPFallback = mcpMethod != nil && mcpCredential != "test-token"
+        if usesMCPFallback {
+            XCTAssertNil(records.last?["account_id"])
+            XCTAssertNil(records.last?["provider"])
+        } else if apiKeyMode {
             XCTAssertEqual(records.last?["provider"], "fixture-provider")
             XCTAssertNil(records.last?["account_id"])
         } else {
             XCTAssertEqual(records.last?["account_id"], "fixture")
         }
-        XCTAssertEqual(records.last?["proxy"], direct ? "none" : "test")
+        XCTAssertEqual(records.last?["proxy"], usesMCPFallback ? (mcpFallback ?? "none") : (direct ? "none" : "test"))
         if direct { XCTAssertEqual(records.last?["proxy_endpoint"], "none") }
         XCTAssertEqual(records.last?["status"], "200")
+        if mcpMethod != nil {
+            XCTAssertEqual(records.last?["service"], "openaiDeveloperDocs")
+            XCTAssertEqual(records.last?["routing"], usesMCPFallback ? "mcp_fallback" : "credential")
+        }
         XCTAssertEqual(records.last?["received_bytes"], "27")
         let text = try String(contentsOf: logURL, encoding: .utf8)
         XCTAssertFalse(text.contains("test-token"))

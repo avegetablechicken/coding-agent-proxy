@@ -16,6 +16,10 @@ proxies:
 # Without this setting, unmatched credentials are refused.
 # openai_fallback_proxy: us  # Or none for explicit direct access.
 
+# Public docs MCP: use this proxy when no credential route can be selected.
+# Omitted (or none) means direct access. Independent of openai_fallback_proxy.
+# mcp_fallback_proxy: jp
+
 accounts:
   "replace-with-us-account-id": us
   "replace-with-jp-account-id": jp

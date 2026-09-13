@@ -19,6 +19,8 @@ private final class NoRedirects: NSObject, URLSessionTaskDelegate, Sendable {
 }
 
 public actor Forwarder {
+    public static let docsMCPPath = "/mcp/openaiDeveloperDocs"
+    public static let docsMCPUpstream = "https://developers.openai.com/mcp"
     private let configPath: String
     private let port: UInt16
     private let identitySource: any IdentitySource
@@ -142,21 +144,37 @@ public actor Forwarder {
             let config = try Configuration.read(configPath)
             guard config.listen_port == port else { throw ProxyError("listen_port changed; restart the server.") }
             stage = "authorization"
-            let route: CredentialRoute
-            do {
-                route = try config.resolveRoute(authorization: incoming.headers["authorization"]) {
+            let requestPath = String(incoming.target.split(separator: "?", maxSplits: 1).first ?? "")
+            let docsMCP = requestPath == Self.docsMCPPath
+            let route: CredentialRoute?
+            let name: String
+            if docsMCP {
+                let selection = config.resolveMCPRoute(authorization: incoming.headers["authorization"],
+                                                       accountID: incoming.headers["chatgpt-account-id"]) {
                     try self.identitySource.load(configuration: config)
                 }
-            } catch let rejection as RouteRejection {
-                status = rejection.status
-                outcome = "request_rejected"
-                fields["reason"] = rejection.message
-                await client.error(status: status, message: rejection.message)
-                return
+                route = selection.credential
+                name = selection.proxy
+                fields["routing"] = route == nil ? "mcp_fallback" : "credential"
+                fields["service"] = "openaiDeveloperDocs"
+            } else {
+                do {
+                    let selected = try config.resolveRoute(authorization: incoming.headers["authorization"]) {
+                        try self.identitySource.load(configuration: config)
+                    }
+                    route = selected
+                    name = selected.proxy
+                } catch let rejection as RouteRejection {
+                    status = rejection.status
+                    outcome = "request_rejected"
+                    fields["reason"] = rejection.message
+                    await client.error(status: status, message: rejection.message)
+                    return
+                }
             }
-            fields["account_id"] = route.accountID
-            fields["provider"] = route.provider
-            if let expected = route.accountID, let account = incoming.headers["chatgpt-account-id"], account != expected {
+            fields["account_id"] = route?.accountID
+            fields["provider"] = route?.provider
+            if !docsMCP, let expected = route?.accountID, let account = incoming.headers["chatgpt-account-id"], account != expected {
                 status = 409
                 outcome = "request_rejected"
                 fields["reason"] = "account_mismatch"
@@ -164,19 +182,47 @@ public actor Forwarder {
                 return
             }
             stage = "routing"
-            let name = route.proxy
             let proxyURL = config.proxyEndpoint(for: name)
             fields["proxy"] = name
             fields["proxy_endpoint"] = proxyURL
             stage = "request"
-            let url = try Self.upstreamURL(base: route.upstream, target: incoming.target)
+            if requestPath.hasPrefix("/mcp/"), !docsMCP {
+                status = 404
+                outcome = "request_rejected"
+                await client.error(status: status, message: "Unknown MCP endpoint.")
+                return
+            }
+            if docsMCP, !["GET", "POST", "DELETE"].contains(incoming.method) {
+                status = 405
+                outcome = "request_rejected"
+                await client.error(status: status, message: "MCP supports GET, POST and DELETE.")
+                return
+            }
+            let url: URL
+            if docsMCP {
+                // Only this fixed, public MCP destination is allowed. Model credentials
+                // select the local route but must never be sent to the documentation site.
+                guard !incoming.target.contains("#"),
+                      let destination = URL(string: Self.docsMCPUpstream + incoming.target.dropFirst(Self.docsMCPPath.count)) else {
+                    throw ProxyError("Invalid MCP request target.")
+                }
+                url = destination
+            } else {
+                guard let route else { throw ProxyError("Missing model route.") }
+                url = try Self.upstreamURL(base: route.upstream, target: incoming.target)
+            }
             var request = URLRequest(url: url)
             request.httpMethod = incoming.method
             request.httpBody = incoming.body.isEmpty ? nil : incoming.body
-            for (key, value) in Self.forwardHeaders(incoming.headers) { request.setValue(value, forHTTPHeaderField: key) }
-            request.setValue("Bearer \(route.token)", forHTTPHeaderField: "Authorization")
-            if let accountID = route.accountID {
-                request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+            let mcpHeaders: Set<String> = ["accept", "content-type", "mcp-session-id", "mcp-protocol-version", "last-event-id"]
+            for (key, value) in Self.forwardHeaders(incoming.headers) where !docsMCP || mcpHeaders.contains(key.lowercased()) {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+            if !docsMCP, let route {
+                request.setValue("Bearer \(route.token)", forHTTPHeaderField: "Authorization")
+                if let accountID = route.accountID {
+                    request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+                }
             }
             request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
             let session = try session(proxyURL: proxyURL, timeout: config.request_timeout_seconds)

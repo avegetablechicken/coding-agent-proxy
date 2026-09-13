@@ -23,6 +23,35 @@ final class CoreTests: XCTestCase {
         XCTAssertThrowsError(try config.proxyName(for: Identity(accountID: "unknown", accessToken: "a")))
     }
 
+    func testMCPFallbackIsIndependentOfOpenAIFallback() throws {
+        let config = try Configuration.parse(yaml + "\nopenai_fallback_proxy: us\nmcp_fallback_proxy: jp")
+        let identity = { Identity(accountID: "account-a", accessToken: "known") }
+        XCTAssertEqual(config.resolveMCPRoute(authorization: "Bearer known", loadIdentity: identity).proxy, "us")
+        for header in [nil, "", "Basic secret", "Bearer unknown", "Bearer two words"] as [String?] {
+            let selection = config.resolveMCPRoute(authorization: header, loadIdentity: identity)
+            XCTAssertEqual(selection.proxy, "jp")
+            XCTAssertNil(selection.credential)
+        }
+        XCTAssertEqual(config.resolveMCPRoute(authorization: "Bearer known", accountID: "different", loadIdentity: identity).proxy, "jp")
+        XCTAssertEqual(config.resolveMCPRoute(authorization: "Bearer known", loadIdentity: {
+            throw ProxyError("unavailable")
+        }).proxy, "jp")
+        XCTAssertEqual(config.resolveMCPRoute(authorization: "Bearer known", loadIdentity: {
+            Identity(accountID: "unmapped", accessToken: "known")
+        }).proxy, "jp")
+        let direct = try Configuration.parse(yaml.replacingOccurrences(of: "account-a: us", with: "account-a: none")
+                                            + "\nmcp_fallback_proxy: jp")
+        XCTAssertEqual(direct.resolveMCPRoute(authorization: "Bearer known", loadIdentity: identity).proxy, "none")
+        let defaults = try Configuration.parse(yaml + "\nopenai_fallback_proxy: us")
+        XCTAssertEqual(defaults.resolveMCPRoute(authorization: "Bearer unknown").proxy, "none")
+        let onlyMCP = try Configuration.parse("listen_port: 7889\nrequest_timeout_seconds: 30")
+        XCTAssertEqual(onlyMCP.resolveMCPRoute(authorization: nil).proxy, "none")
+        XCTAssertThrowsError(try onlyMCP.resolveRoute(authorization: "Bearer unknown"))
+        for fallback in ["missing", "''"] {
+            XCTAssertThrowsError(try Configuration.parse(yaml + "\nmcp_fallback_proxy: \(fallback)"))
+        }
+    }
+
     func testOpenAIFallbackRequiresExplicitProxyAndPreservesToken() throws {
         let config = try Configuration.parse(yaml + "\nopenai_fallback_proxy: jp")
         let identity = { Identity(accountID: "account-a", accessToken: "known") }

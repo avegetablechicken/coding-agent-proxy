@@ -18,9 +18,10 @@ public struct Configuration: Decodable, Sendable {
     public let accounts: [String: String]
     public let providers: [APIKeyProvider]
     public let openai_fallback_proxy: String?
+    public let mcp_fallback_proxy: String?
 
     enum CodingKeys: String, CodingKey {
-        case listen_port, auth_file, upstream_base_url, request_timeout_seconds, proxies, accounts, api_key_providers, openai_fallback_proxy, api_key_upstream_base_url
+        case listen_port, auth_file, upstream_base_url, request_timeout_seconds, proxies, accounts, api_key_providers, openai_fallback_proxy, api_key_upstream_base_url, mcp_fallback_proxy
     }
 
     public init(from decoder: Decoder) throws {
@@ -34,6 +35,7 @@ public struct Configuration: Decodable, Sendable {
         accounts = try values.decodeIfPresent([String: String].self, forKey: .accounts) ?? [:]
         providers = try values.decodeIfPresent([APIKeyProvider].self, forKey: .api_key_providers) ?? []
         openai_fallback_proxy = try values.decodeIfPresent(String.self, forKey: .openai_fallback_proxy)
+        mcp_fallback_proxy = try values.decodeIfPresent(String.self, forKey: .mcp_fallback_proxy)
     }
 
     public static func read(_ path: String) throws -> Configuration {
@@ -46,7 +48,7 @@ public struct Configuration: Decodable, Sendable {
     public static func parse(_ text: String) throws -> Configuration {
         let result: Configuration
         do {
-            let allowed: Set<String> = ["listen_port", "auth_file", "upstream_base_url", "request_timeout_seconds", "proxies", "accounts", "api_key_providers", "openai_fallback_proxy", "api_key_upstream_base_url"]
+            let allowed: Set<String> = ["listen_port", "auth_file", "upstream_base_url", "request_timeout_seconds", "proxies", "accounts", "api_key_providers", "openai_fallback_proxy", "api_key_upstream_base_url", "mcp_fallback_proxy"]
             guard let root = try compose(yaml: text)?.mapping,
                   root.keys.allSatisfy({ $0.string.map { allowed.contains($0) } == true }) else {
                 throw ProxyError("Unknown configuration field.")
@@ -64,13 +66,9 @@ public struct Configuration: Decodable, Sendable {
         catch { throw ProxyError("Invalid YAML configuration; check required fields against config.example.yaml.") }
         guard result.listen_port > 0,
               result.request_timeout_seconds.isFinite,
-              (1...3600).contains(result.request_timeout_seconds),
-              !result.providers.isEmpty || !result.auth_file.isEmpty || result.openai_fallback_proxy != nil else { throw ProxyError("Invalid port, auth_file or timeout (1–3600 seconds).") }
+              (1...3600).contains(result.request_timeout_seconds) else { throw ProxyError("Invalid port or timeout (1–3600 seconds).") }
         try validateUpstream(result.upstream_base_url)
         try validateUpstream(result.api_key_upstream_base_url)
-        guard !result.providers.isEmpty || !result.accounts.isEmpty || result.openai_fallback_proxy != nil else {
-            throw ProxyError("Configure at least one proxy and credential route.")
-        }
         guard result.auth_file.isEmpty == result.accounts.isEmpty else {
             throw ProxyError("ChatGPT routing requires both auth_file and account mappings.")
         }
@@ -86,6 +84,11 @@ public struct Configuration: Decodable, Sendable {
         if let fallback = result.openai_fallback_proxy {
             guard !fallback.isEmpty, (fallback == "none" || result.proxies[fallback] != nil) else {
                 throw ProxyError("openai_fallback_proxy must select an existing proxy or none.")
+            }
+        }
+        if let fallback = result.mcp_fallback_proxy {
+            guard !fallback.isEmpty, (fallback == "none" || result.proxies[fallback] != nil) else {
+                throw ProxyError("mcp_fallback_proxy must select an existing proxy or none.")
             }
         }
         for provider in result.providers {
@@ -167,7 +170,7 @@ public struct Configuration: Decodable, Sendable {
     }
 
     /// Load each credential once and select only by the incoming Bearer token.
-    public func resolveRoute(authorization: String?, loadIdentity: (() throws -> Identity)? = nil) throws -> CredentialRoute {
+    public func resolveRoute(authorization: String?, allowOpenAIFallback: Bool = true, loadIdentity: (() throws -> Identity)? = nil) throws -> CredentialRoute {
         guard let authorization, authorization.hasPrefix("Bearer "),
               !authorization.dropFirst(7).isEmpty else {
             throw RouteRejection(status: 401, message: "A configured Bearer token is required.")
@@ -203,12 +206,24 @@ public struct Configuration: Decodable, Sendable {
                 proxy: try proxyName(for: identity), upstream: upstream_base_url)
         }
         if let route = matches.first { return route }
-        if let proxy = openai_fallback_proxy {
+        if allowOpenAIFallback, let proxy = openai_fallback_proxy {
             return CredentialRoute(token: token, accountID: nil, provider: "openai-fallback",
                                    proxy: proxy, upstream: api_key_upstream_base_url)
         }
         if unavailable { throw ProxyError("No matching route; one or more credential sources are unavailable.") }
         throw RouteRejection(status: 401, message: "Bearer token does not match a configured credential.")
+    }
+
+    /// Public documentation requests can proceed without a model credential.
+    /// Only an exact, unambiguous credential match inherits a model route.
+    public func resolveMCPRoute(authorization: String?, accountID: String? = nil,
+                                loadIdentity: (() throws -> Identity)? = nil) -> (credential: CredentialRoute?, proxy: String) {
+        if let route = try? resolveRoute(authorization: authorization, allowOpenAIFallback: false, loadIdentity: loadIdentity),
+           accountID == nil || accountID == route.accountID,
+           route.proxy == "none" || proxies[route.proxy] != nil {
+            return (route, route.proxy)
+        }
+        return (nil, mcp_fallback_proxy ?? "none")
     }
 
     public func checkCredentials() throws {
