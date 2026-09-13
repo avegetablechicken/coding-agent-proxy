@@ -62,14 +62,14 @@ accounts:
                 staged = temp / "config.next"
                 staged.write_text(value)
                 staged.replace(config)
-            def request(token="token-a", account=None, path="/responses"):
+            def request(token="token-a", account=None, path="/responses", method=None):
                 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=8)
                 headers = {"Content-Type": "application/json"}
                 if token is not None:
                     headers["Authorization"] = "Bearer " + token
                 if account is not None:
                     headers["ChatGPT-Account-Id"] = account
-                conn.request("GET" if path == "/health" else "POST", path, body=b'{"private":"secret-body"}', headers=headers)
+                conn.request(method or ("GET" if path == "/health" else "POST"), path, body=b'{"private":"secret-body"}', headers=headers)
                 response = conn.getresponse()
                 result = response.status, response.read()
                 conn.close()
@@ -225,6 +225,15 @@ api_key_providers:
             assert request(token=None, path="/mcp/openaiDeveloperDocs")[0] == 502
             assert len(a.requests) > previous_a and len(b.requests) == previous_b
             print("PASS: MCP follows matched ChatGPT/API routes, missing credentials use independent hot-reloaded fallback")
+            for path in ["/backend-api/wham/usage", "/backend-api/wham/rate-limit-reset-credits"]:
+                previous_a, previous_b = len(a.requests), len(b.requests)
+                assert request(token="chat-mixed-token", path=path, method="GET")[0] == 502
+                assert len(a.requests) > previous_a and len(b.requests) == previous_b
+                assert a.requests[-1].startswith(b"CONNECT chatgpt-mixed.invalid:443 ")
+                total_before = len(a.requests) + len(b.requests)
+                assert request(token="provider-key-one", path=path, method="GET")[0] == 403
+                assert len(a.requests) + len(b.requests) == total_before
+            print("PASS: account usage/credits use matched ChatGPT proxy; API keys rejected before CONNECT")
             total = len(a.requests) + len(b.requests)
             assert request(token="unknown")[0] == 401
             key_b.write_text("provider-key-one")

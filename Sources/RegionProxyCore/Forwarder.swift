@@ -101,6 +101,40 @@ public actor Forwarder {
         return url
     }
 
+    /// Only the two read-only account queries used by Codex /status are exposed.
+    public static func accountQuerySuffix(target: String) -> String? {
+        let explicit = target.hasPrefix("/https://") || target.hasPrefix("/http://")
+        guard let components = URLComponents(string: explicit ? String(target.dropFirst()) : target) else { return nil }
+        switch components.path {
+        case "/backend-api/wham/usage": return "/wham/usage"
+        case "/backend-api/wham/rate-limit-reset-credits":
+            return "/wham/rate-limit-reset-credits"
+        default: return nil
+        }
+    }
+
+    public static func accountQueryURL(base: String, target: String) throws -> URL {
+        guard let suffix = accountQuerySuffix(target: target),
+              var backend = URLComponents(string: base), backend.path.hasSuffix("/backend-api/codex") else {
+            throw ProxyError("Account queries require a ChatGPT upstream ending in /backend-api/codex.")
+        }
+        backend.path = String(backend.path.dropLast("/codex".count))
+        guard let root = backend.string else { throw ProxyError("Invalid ChatGPT backend URL.") }
+        if target.hasPrefix("/https://") || target.hasPrefix("/http://") {
+            let url = try upstreamURL(base: root, target: target)
+            guard url.path == backend.path + suffix else { throw ProxyError("Unsupported account query path.") }
+            return url
+        }
+        guard let query = URLComponents(string: target), !target.hasPrefix("//"), query.fragment == nil,
+              !target.contains("\\"), target.removingPercentEncoding?.contains("\\") == false else {
+            throw ProxyError("Invalid account query target.")
+        }
+        backend.path += suffix
+        backend.percentEncodedQuery = query.percentEncodedQuery
+        guard let url = backend.url else { throw ProxyError("Invalid account query URL.") }
+        return url
+    }
+
     public static func forwardHeaders(_ headers: [String: String]) -> [String: String] {
         var excluded: Set<String> = ["host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                                      "te", "trailer", "transfer-encoding", "upgrade", "content-length",
@@ -146,6 +180,7 @@ public actor Forwarder {
             stage = "authorization"
             let requestPath = String(incoming.target.split(separator: "?", maxSplits: 1).first ?? "")
             let docsMCP = requestPath == Self.docsMCPPath
+            let accountQuery = Self.accountQuerySuffix(target: incoming.target) != nil
             let route: CredentialRoute?
             let name: String
             if docsMCP {
@@ -199,7 +234,22 @@ public actor Forwarder {
                 return
             }
             let url: URL
-            if docsMCP {
+            if accountQuery {
+                guard let route, route.accountID != nil else {
+                    status = 403
+                    outcome = "request_rejected"
+                    await client.error(status: status, message: "Account usage queries require a matched ChatGPT login credential.")
+                    return
+                }
+                guard incoming.method == "GET" else {
+                    status = 405
+                    outcome = "request_rejected"
+                    await client.error(status: status, message: "Account usage queries support GET only.")
+                    return
+                }
+                url = try Self.accountQueryURL(base: route.upstream, target: incoming.target)
+                fields["service"] = "chatgptUsage"
+            } else if docsMCP {
                 // Only this fixed, public MCP destination is allowed. Model credentials
                 // select the local route but must never be sent to the documentation site.
                 guard !incoming.target.contains("#"),

@@ -326,6 +326,35 @@ curl --noproxy '*' http://127.0.0.1:8787/health
 
 A successful health response confirms only that the listener is alive, not that credentials, mappings, or the upstream service are available.
 
+## ChatGPT account usage queries
+
+For Codex CLI `/status` usage limits, keep the model endpoint and also set this
+top-level key in `~/.codex/config.toml` (before any TOML table):
+
+```toml
+openai_base_url = "http://127.0.0.1:7889/v1"
+chatgpt_base_url = "http://127.0.0.1:7889/backend-api"
+```
+
+Restart Codex after changing its config. Usage queries use `chatgpt_base_url`,
+independently of the model endpoint. The service forwards GET requests for
+`/backend-api/wham/usage` and `/backend-api/wham/rate-limit-reset-credits` to
+the sibling `/backend-api/wham/...` paths of the configured ChatGPT upstream.
+That upstream must end in `/backend-api/codex`. Incoming account query paths
+retain the official `/backend-api/wham/...` structure without shortened aliases.
+Keep `/backend-api` in `chatgpt_base_url`: Codex only automatically adds that
+prefix for official ChatGPT hostnames, not for a loopback address.
+The explicit upstream form `/https://chatgpt.com/backend-api/wham/usage` works
+when its origin matches the configured ChatGPT upstream.
+
+Queries require a matching ChatGPT access token and use that account's proxy;
+the account header is checked when supplied and added to the upstream request.
+API Keys and unmatched tokens cannot query ChatGPT subscription limits, even
+when OpenAI API fallback is configured. Responses and query parameters are
+passed through. MCP fallback does not apply. Only these two read-only account
+endpoints are added; this is not a general ChatGPT backend proxy, and other
+features using `chatgpt_base_url` may require additional endpoints.
+
 ## OpenAI documentation MCP
 
 The fixed endpoint `/mcp/openaiDeveloperDocs` forwards Streamable HTTP to
