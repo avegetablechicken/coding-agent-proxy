@@ -80,7 +80,7 @@ api_key_upstream_base_url: "https://api.openai.com/v1"
 The first setting controls account routing; the second is the default for API Key
 routes and the destination for unmatched-token fallback. Both must be real HTTPS
 upstream addresses. The fallback still requires `openai_fallback_proxy` (a proxy
-name); setting a default URL alone does not enable fallback.
+name or explicit `none`); setting a default URL alone does not enable fallback.
 
 ## Bearer routing: ChatGPT and API Key providers
 
@@ -143,14 +143,16 @@ and send their original `Authorization: Bearer <token>`:
 - If no credential matches, optional `openai_fallback_proxy: us` sends the original
   Bearer token to `api_key_upstream_base_url` through that named proxy. It also applies
   when a credential source is unavailable. There is no credential conversion and no
-  direct connection; the upstream decides whether the supplied token is valid.
+  implicit direct connection; use `none` to explicitly select direct access. The upstream
+  decides whether the supplied token is valid.
 - Without `openai_fallback_proxy`, an unknown token returns 401 when all credential
   sources are available, or 502 if any source is unavailable.
 - Missing/malformed Bearer headers return 401. Multiple credential matches return
   409. These errors, account mismatch, and failures on a matched route do not trigger
   fallback. The fallback uses the top-level API Key URL and sends no ChatGPT account header.
 
-`openai_fallback_proxy` must reference an existing entry in `proxies`. It is disabled
+`openai_fallback_proxy` must reference an existing entry in `proxies` or be `none`
+for explicit direct access. It is disabled
 by default and can be used without account or API Key mappings. Explicit upstream
 paths still must match the selected route: a path naming another service is never
 silently sent to OpenAI.
@@ -184,6 +186,27 @@ conversion. The base URL includes the upstream API prefix, such as `/v1`;
 `/v1/responses` maps to `/responses` under it. Incoming `x-api-key` and `api-key`
 headers are stripped and are not alternative authentication methods. Each service
 must support the requested endpoint and Bearer authentication.
+
+## Explicit direct connections
+
+Use the reserved value `none` to disable the outgoing HTTP/SOCKS/PAC proxy for a
+route. For example:
+
+```yaml
+accounts:
+  your-account-id: none
+api_key_providers:
+  - name: openai
+    proxy: none
+openai_fallback_proxy: none
+```
+
+Each setting is independent. You can also give a proxy alias the value `none`,
+such as `proxies: {us: none}`. The name `none` itself is reserved and cannot be
+defined as a proxy alias. If all routes are direct, `proxies` may be omitted.
+Missing route or fallback settings do not imply direct access. Configured proxy
+failures never switch to direct mode. Logs show `proxy_endpoint: "none"` for direct
+requests. Upstream HTTPS validation and credential routing remain unchanged.
 
 ## Explicit upstream URL in the path
 

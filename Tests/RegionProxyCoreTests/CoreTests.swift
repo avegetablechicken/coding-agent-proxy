@@ -57,6 +57,35 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(try fallbackOnly.resolveRoute(authorization: "Bearer test").proxy, "selected")
     }
 
+    func testExplicitNoneSelectsDirectTransport() throws {
+        let config = try Configuration.parse(yaml.replacingOccurrences(of: "account-a: us", with: "account-a: none")
+            + "\nopenai_fallback_proxy: none")
+        let identity = { Identity(accountID: "account-a", accessToken: "known") }
+        for token in ["known", "unknown"] {
+            let route = try config.resolveRoute(authorization: "Bearer \(token)", loadIdentity: identity)
+            XCTAssertEqual(route.proxy, "none")
+            XCTAssertEqual(config.proxyEndpoint(for: route.proxy), "none")
+        }
+        let alias = try Configuration.parse(yaml.replacingOccurrences(of: "http://127.0.0.1:8101", with: "none"))
+        XCTAssertEqual(alias.proxyEndpoint(for: "us"), "none")
+        let directOnly = try Configuration.parse("""
+        listen_port: 7889
+        request_timeout_seconds: 30
+        openai_fallback_proxy: none
+        """)
+        XCTAssertEqual(try directOnly.resolveRoute(authorization: "Bearer key").proxy, "none")
+        let transport = URLSessionConfiguration.ephemeral
+        transport.connectionProxyDictionary = ["HTTPEnable": 1, "HTTPProxy": "unwanted.invalid", "ProxyAutoConfigEnable": 1]
+        transport.proxyConfigurations = [try Configuration.proxyConfiguration("http://127.0.0.1:8101")]
+        try Configuration.configureTransport(transport, endpoint: "none")
+        XCTAssertEqual(transport.proxyConfigurations.count, 0)
+        XCTAssertEqual(transport.connectionProxyDictionary?["HTTPEnable"] as? Int, 0)
+        XCTAssertEqual(transport.connectionProxyDictionary?["ProxyAutoConfigEnable"] as? Int, 0)
+        XCTAssertNil(transport.connectionProxyDictionary?["HTTPProxy"])
+        try Configuration.configureTransport(transport, endpoint: "http://127.0.0.1:8101")
+        XCTAssertEqual(transport.proxyConfigurations.count, 1)
+    }
+
     func testInvalidConfigurationsFailClosed() throws {
         for text in [yaml.replacingOccurrences(of: "account-a: us", with: "account-a: missing"),
                      yaml.replacingOccurrences(of: "8787", with: "0"),

@@ -30,7 +30,7 @@ public struct Configuration: Decodable, Sendable {
         upstream_base_url = try values.decodeIfPresent(String.self, forKey: .upstream_base_url) ?? "https://chatgpt.com/backend-api/codex"
         api_key_upstream_base_url = try values.decodeIfPresent(String.self, forKey: .api_key_upstream_base_url) ?? "https://api.openai.com/v1"
         request_timeout_seconds = try values.decode(Double.self, forKey: .request_timeout_seconds)
-        proxies = try values.decode([String: String].self, forKey: .proxies)
+        proxies = try values.decodeIfPresent([String: String].self, forKey: .proxies) ?? [:]
         accounts = try values.decodeIfPresent([String: String].self, forKey: .accounts) ?? [:]
         providers = try values.decodeIfPresent([APIKeyProvider].self, forKey: .api_key_providers) ?? []
         openai_fallback_proxy = try values.decodeIfPresent(String.self, forKey: .openai_fallback_proxy)
@@ -68,29 +68,29 @@ public struct Configuration: Decodable, Sendable {
               !result.providers.isEmpty || !result.auth_file.isEmpty || result.openai_fallback_proxy != nil else { throw ProxyError("Invalid port, auth_file or timeout (1–3600 seconds).") }
         try validateUpstream(result.upstream_base_url)
         try validateUpstream(result.api_key_upstream_base_url)
-        guard !result.proxies.isEmpty, !result.providers.isEmpty || !result.accounts.isEmpty || result.openai_fallback_proxy != nil else {
+        guard !result.providers.isEmpty || !result.accounts.isEmpty || result.openai_fallback_proxy != nil else {
             throw ProxyError("Configure at least one proxy and credential route.")
         }
         guard result.auth_file.isEmpty == result.accounts.isEmpty else {
             throw ProxyError("ChatGPT routing requires both auth_file and account mappings.")
         }
         for (name, value) in result.proxies {
-            guard !name.isEmpty else { throw ProxyError("Proxy names must not be empty.") }
-            _ = try Self.proxyConfiguration(value)
+            guard !name.isEmpty, name != "none" else { throw ProxyError("Proxy names must be nonempty; none is reserved for direct connections.") }
+            if value != "none" { _ = try Self.proxyConfiguration(value) }
         }
         for (id, name) in result.accounts {
-            guard !id.isEmpty, result.proxies[name] != nil else {
-                throw ProxyError("Every account must reference an existing proxy name.")
+            guard !id.isEmpty, (name == "none" || result.proxies[name] != nil) else {
+                throw ProxyError("Every account must select an existing proxy name or none.")
             }
         }
         if let fallback = result.openai_fallback_proxy {
-            guard !fallback.isEmpty, result.proxies[fallback] != nil else {
-                throw ProxyError("openai_fallback_proxy must reference an existing proxy.")
+            guard !fallback.isEmpty, (fallback == "none" || result.proxies[fallback] != nil) else {
+                throw ProxyError("openai_fallback_proxy must select an existing proxy or none.")
             }
         }
         for provider in result.providers {
             try validateUpstream(provider.upstream_base_url ?? result.api_key_upstream_base_url)
-            guard !provider.name.isEmpty, result.proxies[provider.proxy] != nil,
+            guard !provider.name.isEmpty, (provider.proxy == "none" || result.proxies[provider.proxy] != nil),
                   !(provider.api_key_env != nil && provider.api_key_file != nil),
                   provider.api_key_env.map({ !$0.isEmpty }) ?? true,
                   provider.api_key_file.map({ !$0.isEmpty }) ?? true else {
@@ -128,6 +128,24 @@ public struct Configuration: Decodable, Sendable {
         let embedded = String(outer.percentEncodedPath.dropFirst())
         try validateUpstream(embedded)
         return embedded
+    }
+
+    public func proxyEndpoint(for name: String) -> String {
+        name == "none" ? "none" : proxies[name]!
+    }
+
+    static func configureTransport(_ configuration: URLSessionConfiguration, endpoint: String) throws {
+        if endpoint == "none" {
+            configuration.proxyConfigurations = []
+            // Empty proxyConfigurations alone can leave system/PAC proxy discovery enabled.
+            configuration.connectionProxyDictionary = [
+                "HTTPEnable": 0, "HTTPSEnable": 0, "SOCKSEnable": 0,
+                "ProxyAutoConfigEnable": 0, "ProxyAutoDiscoveryEnable": 0
+            ]
+        } else {
+            configuration.connectionProxyDictionary = ["ExceptionsList": [], "ExcludeSimpleHostnames": false]
+            configuration.proxyConfigurations = [try proxyConfiguration(endpoint)]
+        }
     }
 
     public static func proxyConfiguration(_ value: String) throws -> Network.ProxyConfiguration {

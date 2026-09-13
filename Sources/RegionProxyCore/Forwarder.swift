@@ -45,14 +45,14 @@ public actor Forwarder {
                     let identity = try self.identitySource.load(configuration: config)
                     let name = try config.proxyName(for: identity)
                     logger?.write("current_route", ["account_id": identity.accountID, "proxy": name,
-                                                   "proxy_endpoint": config.proxies[name]!])
+                                                   "proxy_endpoint": config.proxyEndpoint(for: name)])
                 } catch {
                     logger?.write("route_unavailable", ["reason": (error as? ProxyError)?.message ?? "Cannot read current account route."])
                 }
             }
             for provider in config.providers {
                 var providerFields = ["provider": provider.name, "proxy": provider.proxy,
-                                      "proxy_endpoint": config.proxies[provider.proxy]!]
+                                      "proxy_endpoint": config.proxyEndpoint(for: provider.proxy)]
                 do {
                     _ = try provider.resolveCredential(defaultUpstream: config.api_key_upstream_base_url)
                     logger?.write("current_route", providerFields)
@@ -165,7 +165,7 @@ public actor Forwarder {
             }
             stage = "routing"
             let name = route.proxy
-            let proxyURL = config.proxies[name]!
+            let proxyURL = config.proxyEndpoint(for: name)
             fields["proxy"] = name
             fields["proxy_endpoint"] = proxyURL
             stage = "request"
@@ -247,8 +247,7 @@ public actor Forwarder {
         let key = "\(proxyURL)|\(timeout)"
         if let session = sessions[key] { return session }
         let configuration = sessionConfiguration()
-        configuration.connectionProxyDictionary = ["ExceptionsList": [], "ExcludeSimpleHostnames": false]
-        configuration.proxyConfigurations = [try Configuration.proxyConfiguration(proxyURL)]
+        try Configuration.configureTransport(configuration, endpoint: proxyURL)
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
         configuration.httpShouldSetCookies = false

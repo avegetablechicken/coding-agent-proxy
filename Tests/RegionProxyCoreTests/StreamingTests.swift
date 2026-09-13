@@ -59,7 +59,11 @@ final class StreamingTests: XCTestCase {
         try await exerciseStreaming(apiKeyMode: false, explicitPath: true)
     }
 
-    private func exerciseStreaming(apiKeyMode: Bool, explicitPath: Bool = false) async throws {
+    func testExplicitDirectAPIKeyStreaming() async throws {
+        try await exerciseStreaming(apiKeyMode: true, direct: true)
+    }
+
+    private func exerciseStreaming(apiKeyMode: Bool, explicitPath: Bool = false, direct: Bool = false) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -96,6 +100,11 @@ final class StreamingTests: XCTestCase {
               proxy: test
               api_key_file: "\(keyFile.path)"
             """.write(to: config, atomically: true, encoding: .utf8)
+        }
+        if direct {
+            try String(contentsOf: config, encoding: .utf8)
+                .replacingOccurrences(of: "proxy: test", with: "proxy: none")
+                .write(to: config, atomically: true, encoding: .utf8)
         }
         let logURL = directory.appendingPathComponent("proxy.log")
         let logger = try RequestLogger(fileURL: logURL, console: nil)
@@ -150,7 +159,8 @@ final class StreamingTests: XCTestCase {
         } else {
             XCTAssertEqual(records.last?["account_id"], "fixture")
         }
-        XCTAssertEqual(records.last?["proxy"], "test")
+        XCTAssertEqual(records.last?["proxy"], direct ? "none" : "test")
+        if direct { XCTAssertEqual(records.last?["proxy_endpoint"], "none") }
         XCTAssertEqual(records.last?["status"], "200")
         XCTAssertEqual(records.last?["received_bytes"], "27")
         let text = try String(contentsOf: logURL, encoding: .utf8)
