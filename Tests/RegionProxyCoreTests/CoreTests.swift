@@ -23,6 +23,40 @@ final class CoreTests: XCTestCase {
         XCTAssertThrowsError(try config.proxyName(for: Identity(accountID: "unknown", accessToken: "a")))
     }
 
+    func testOpenAIFallbackRequiresExplicitProxyAndPreservesToken() throws {
+        let config = try Configuration.parse(yaml + "\nopenai_fallback_proxy: jp")
+        let identity = { Identity(accountID: "account-a", accessToken: "known") }
+        let matched = try config.resolveRoute(authorization: "Bearer known", loadIdentity: identity)
+        XCTAssertEqual(matched.proxy, "us")
+        XCTAssertEqual(matched.accountID, "account-a")
+        let loaders: [() throws -> Identity] = [identity, { throw ProxyError("missing auth") }]
+        for loader in loaders {
+            let route = try config.resolveRoute(authorization: "Bearer unknown", loadIdentity: loader)
+            XCTAssertEqual(route.token, "unknown")
+            XCTAssertEqual(route.proxy, "jp")
+            XCTAssertEqual(route.upstream, "https://api.openai.com/v1")
+            XCTAssertEqual(route.provider, "openai-fallback")
+            XCTAssertNil(route.accountID)
+        }
+        for header in [nil, "", "Basic secret", "Bearer ", "Bearer two words"] as [String?] {
+            XCTAssertThrowsError(try config.resolveRoute(authorization: header, loadIdentity: identity)) {
+                XCTAssertEqual(($0 as? RouteRejection)?.status, 401)
+            }
+        }
+        for value in ["missing", "''"] {
+            XCTAssertThrowsError(try Configuration.parse(yaml + "\nopenai_fallback_proxy: \(value)"))
+        }
+        XCTAssertThrowsError(try Configuration.parse(yaml).resolveRoute(authorization: "Bearer unknown", loadIdentity: identity))
+        let fallbackOnly = try Configuration.parse("""
+        listen_port: 7889
+        request_timeout_seconds: 30
+        proxies:
+          selected: http://127.0.0.1:8118
+        openai_fallback_proxy: selected
+        """)
+        XCTAssertEqual(try fallbackOnly.resolveRoute(authorization: "Bearer test").proxy, "selected")
+    }
+
     func testInvalidConfigurationsFailClosed() throws {
         for text in [yaml.replacingOccurrences(of: "account-a: us", with: "account-a: missing"),
                      yaml.replacingOccurrences(of: "8787", with: "0"),
@@ -62,6 +96,20 @@ final class CoreTests: XCTestCase {
     func testHeaderFiltering() {
         let result = Forwarder.forwardHeaders(["connection": "x-private, keep-alive", "x-private": "hidden", "authorization": "secret", "host": "localhost", "content-length": "5", "x-request-id": "abc", "content-type": "application/json"])
         XCTAssertEqual(result, ["x-request-id": "abc", "content-type": "application/json"])
+    }
+
+    func testExplicitUpstreamPathPreservesEndpointAndQuery() throws {
+        let base = "https://provider.example.com/v1"
+        XCTAssertEqual(try Forwarder.upstreamURL(base: base, target: "/https://provider.example.com/v1/models?cursor=a%2Fb").absoluteString,
+                       "https://provider.example.com/v1/models?cursor=a%2Fb")
+        XCTAssertEqual(try Forwarder.upstreamURL(base: base, target: "/https://provider.example.com/v1/responses").absoluteString,
+                       base + "/responses")
+        for target in ["/https://evil.example.com/v1/responses", "/http://provider.example.com/v1/responses",
+                       "/https://provider.example.com:444/v1/responses", "/https://secret@provider.example.com/v1/responses",
+                       "/https://provider.example.com/v10/responses", "/https://provider.example.com/admin",
+                       "/https://provider.example.com/v1/%2e%2e/admin"] {
+            XCTAssertThrowsError(try Forwarder.upstreamURL(base: base, target: target))
+        }
     }
 
     func testFragmentedBodyAndChunkedUpload() throws {

@@ -8,6 +8,17 @@ private final class FixtureProtocol: URLProtocol, @unchecked Sendable {
     private let lock = NSLock()
     private var stopped = false
     override func startLoading() {
+        if request.url?.path.hasPrefix("/v1/") == true {
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-token")
+            XCTAssertNil(request.value(forHTTPHeaderField: "ChatGPT-Account-Id"))
+            XCTAssertNil(request.value(forHTTPHeaderField: "X-Api-Key"))
+            XCTAssertNil(request.value(forHTTPHeaderField: "Api-Key"))
+            XCTAssertEqual(request.url?.query, "test=1")
+        } else {
+            XCTAssertEqual(request.url?.path, "/backend-api/codex/responses")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-token")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "ChatGPT-Account-Id"), "fixture")
+        }
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
                                        headerFields: ["Content-Type": "text/event-stream", "X-Fixture": "yes"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -33,6 +44,22 @@ private actor RouterSlot {
 @MainActor
 final class StreamingTests: XCTestCase {
     func testSSEArrivesBeforeUpstreamCompletes() async throws {
+        try await exerciseStreaming(apiKeyMode: false)
+    }
+
+    func testAPIKeyAuthenticationHeadersAndStreaming() async throws {
+        try await exerciseStreaming(apiKeyMode: true)
+    }
+
+    func testExplicitUpstreamGETStreaming() async throws {
+        try await exerciseStreaming(apiKeyMode: true, explicitPath: true)
+    }
+
+    func testExplicitChatGPTAccountPathStreaming() async throws {
+        try await exerciseStreaming(apiKeyMode: false, explicitPath: true)
+    }
+
+    private func exerciseStreaming(apiKeyMode: Bool, explicitPath: Bool = false) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -54,6 +81,22 @@ final class StreamingTests: XCTestCase {
         accounts:
           fixture: test
         """.write(to: config, atomically: true, encoding: .utf8)
+        if apiKeyMode {
+            let keyFile = directory.appendingPathComponent("api-key")
+            try "test-token\n".write(to: keyFile, atomically: true, encoding: .utf8)
+            try """
+            listen_port: \(port)
+            upstream_base_url: "https://stream-fixture.invalid/v1"
+            request_timeout_seconds: 10
+            proxies:
+              test: "http://127.0.0.1:1"
+            api_key_providers:
+            - name: fixture-provider
+              upstream_base_url: "https://stream-fixture.invalid/v1"
+              proxy: test
+              api_key_file: "\(keyFile.path)"
+            """.write(to: config, atomically: true, encoding: .utf8)
+        }
         let logURL = directory.appendingPathComponent("proxy.log")
         let logger = try RequestLogger(fileURL: logURL, console: nil)
         await slot.install(Forwarder(configPath: config.path, port: port, logger: logger, sessionConfiguration: {
@@ -63,10 +106,22 @@ final class StreamingTests: XCTestCase {
         }))
         let session = URLSession(configuration: .ephemeral)
         defer { session.invalidateAndCancel() }
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/responses")!)
-        request.httpMethod = "POST"
-        request.httpBody = Data("{}".utf8)
+        let explicitTarget = apiKeyMode ? "/https://stream-fixture.invalid/v1/models?test=1"
+            : "/https://stream-fixture.invalid/backend-api/codex/responses?test=1"
+        let path = explicitPath ? explicitTarget : "/v1/responses?test=1"
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
+        request.httpMethod = explicitPath && apiKeyMode ? "GET" : "POST"
+        request.httpBody = request.httpMethod == "GET" ? nil : Data("{}".utf8)
         request.setValue("Bearer test-token", forHTTPHeaderField: "Authorization")
+        if apiKeyMode {
+            request.setValue("wrong-key", forHTTPHeaderField: "X-Api-Key")
+            request.setValue("another-key", forHTTPHeaderField: "Api-Key")
+            request.setValue("unrelated-account", forHTTPHeaderField: "ChatGPT-Account-Id")
+            var rejected = request
+            rejected.setValue("Bearer incorrect", forHTTPHeaderField: "Authorization")
+            let (_, response) = try await session.data(for: rejected)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 401)
+        }
         let started = Date()
         let (bytes, response) = try await session.bytes(for: request)
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
@@ -86,9 +141,15 @@ final class StreamingTests: XCTestCase {
             if records.last?["event"] == "request_finished" { break }
             try await Task.sleep(for: .milliseconds(10))
         }
-        XCTAssertEqual(records.map { $0["event"] }, ["request_received", "route_selected", "upstream_response", "request_finished"])
-        XCTAssertEqual(Set(records.compactMap { $0["request_id"] }).count, 1)
-        XCTAssertEqual(records.last?["account_id"], "fixture")
+        let successfulRecords = records.filter { $0["request_id"] == records.last?["request_id"] }
+        XCTAssertEqual(successfulRecords.map { $0["event"] }, ["request_received", "route_selected", "upstream_response", "request_finished"])
+        XCTAssertEqual(Set(successfulRecords.compactMap { $0["request_id"] }).count, 1)
+        if apiKeyMode {
+            XCTAssertEqual(records.last?["provider"], "fixture-provider")
+            XCTAssertNil(records.last?["account_id"])
+        } else {
+            XCTAssertEqual(records.last?["account_id"], "fixture")
+        }
         XCTAssertEqual(records.last?["proxy"], "test")
         XCTAssertEqual(records.last?["status"], "200")
         XCTAssertEqual(records.last?["received_bytes"], "27")

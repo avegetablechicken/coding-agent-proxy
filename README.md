@@ -1,15 +1,15 @@
 # coding-agent-proxy
 
-A local macOS reverse proxy that routes coding-agent requests through a specific outbound proxy based on the currently signed-in account.
+A local macOS reverse proxy that selects an upstream service and outbound proxy by matching the request's Bearer credential.
 
-Currently supports **Codex with ChatGPT sign-in**. Account-to-proxy mappings live in YAML and are reloaded for every request. Claude and Gemini adapters are not implemented.
+Supports **Codex with ChatGPT sign-in** and **Bearer routing to multiple API Key providers**. Routes live in YAML and are reloaded for every request. API protocols are passed through; Claude and Gemini protocol adapters are not implemented.
 
 ```text
 Codex → coding-agent-proxy (127.0.0.1:8787)
-      → current account ID from auth.json
-      → account-to-proxy mapping
-      → designated HTTP CONNECT / HTTPS CONNECT / SOCKS5 proxy
-      → ChatGPT Codex upstream
+      → match ChatGPT access token or configured API Key
+      → account/provider route and designated proxy
+      → HTTP CONNECT / HTTPS CONNECT / SOCKS5 proxy
+      → matching ChatGPT or API provider upstream
 ```
 
 ## Features
@@ -68,7 +68,211 @@ Replace each account placeholder with the corresponding `tokens.account_id` from
 .build/release/coding-agent-proxy --config config.yaml
 ```
 
-`--check` validates configuration and the current account mapping; it does not test network reachability. Account mappings, proxy endpoints, credentials, and timeouts take effect on the next request. Changing the listen port requires a restart. Stop with Ctrl-C or SIGTERM.
+`--check` validates configuration, all credential sources, the current account mapping and duplicate credentials; it does not test network reachability. Account mappings, proxy endpoints, credentials, and timeouts take effect on the next request. Changing the listen port requires a restart. Stop with Ctrl-C or SIGTERM.
+
+## Default upstreams
+
+```yaml
+upstream_base_url: "https://chatgpt.com/backend-api/codex"
+api_key_upstream_base_url: "https://api.openai.com/v1"
+```
+
+The first setting controls account routing; the second is the default for API Key
+routes and the destination for unmatched-token fallback. Both must be real HTTPS
+upstream addresses. The fallback still requires `openai_fallback_proxy` (a proxy
+name); setting a default URL alone does not enable fallback.
+
+## Bearer routing: ChatGPT and API Key providers
+
+One `config.yaml` and listener can serve ChatGPT login requests and multiple API
+Key providers at the same time. Keep `auth_file`, `accounts`, and the top-level
+`upstream_base_url` for ChatGPT. Add providers with their own real upstream URLs:
+
+```yaml
+api_key_providers:
+  - name: openai
+    proxy: us
+    # Uses Codex base_url, then top-level api_key_upstream_base_url
+  - name: provider-a
+    upstream_base_url: "https://a.example.com/v1"
+    proxy: us
+    api_key_file: "~/.config/coding-agent-proxy/provider-a.key"
+  - api_key_env: PROVIDER_B_API_KEY
+    upstream_base_url: "https://b.example.com/v1"
+    proxy: jp
+```
+
+These entries extend the existing configuration; see [config.example.yaml](config.example.yaml).
+`proxy` references the shared `proxies` mapping. Each entry needs exactly one key
+source: a file containing the raw API Key (use permissions `0600`), or an environment
+variable. In environment mode, `name` is the Codex Provider ID, resolved through
+`model_providers.<id>.env_key` in `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`).
+The built-in `openai` ID uses `OPENAI_API_KEY`. This reads the base user config;
+profile files and command-line overrides are not resolved. Provider lookup uses
+Homebrew Python 3.11+ (`tomllib`). With `api_key_env` alone, the proxy reverse-matches
+Codex providers by `env_key` to obtain the real `base_url`.
+
+Specify `name`, `api_key_env`, or both. An explicit `api_key_env` always supplies
+the matching key, independently of the named Provider's own credential. When
+`name` is present, it selects the Codex Provider whose `base_url` is read; the
+explicit environment variable need not appear in that Provider's configuration.
+Without `name`, reverse-match by `env_key`; multiple matches make the route
+unavailable. With only `name`, use that Provider's `env_key` for authentication.
+
+Multiple entries can share the same `name`, each with a different `api_key_env`
+and outgoing `proxy`. Duplicate key values still cause ambiguous Bearer routing
+and are rejected. Environment variables must be available to the proxy process,
+not just its client. In file mode, `name` remains a label alongside `api_key_file`,
+and no Codex provider lookup is performed. For API Key-only operation, omit both `auth_file` and `accounts`.
+Upstream priority is: this configuration's explicit `upstream_base_url`, then the
+resolved Codex provider's `base_url`, then top-level `api_key_upstream_base_url`
+(which defaults to `https://api.openai.com/v1`). The built-in
+OpenAI provider also reads Codex's `openai_base_url`. An unmatched `api_key_env`
+uses the explicit upstream or that top-level default. Missing Codex config allows
+that default; malformed/unreadable config fails lookup rather than guessing.
+Invalid resolved URLs are rejected. The route always uses its specified `proxy`
+(the example selects `us`), and never inherits the top-level ChatGPT upstream. Only the `api_key_providers` list format is supported.
+
+Clients all use the same local base URL, for example `http://127.0.0.1:7889/v1`,
+and send their original `Authorization: Bearer <token>`:
+
+- Matching the current `auth.json` access token selects its account mapping and
+  the top-level ChatGPT upstream, with `ChatGPT-Account-Id` validation.
+- Matching a provider's API Key selects that provider's upstream and proxy, without
+  sending a ChatGPT account header.
+- If no credential matches, optional `openai_fallback_proxy: us` sends the original
+  Bearer token to `api_key_upstream_base_url` through that named proxy. It also applies
+  when a credential source is unavailable. There is no credential conversion and no
+  direct connection; the upstream decides whether the supplied token is valid.
+- Without `openai_fallback_proxy`, an unknown token returns 401 when all credential
+  sources are available, or 502 if any source is unavailable.
+- Missing/malformed Bearer headers return 401. Multiple credential matches return
+  409. These errors, account mismatch, and failures on a matched route do not trigger
+  fallback. The fallback uses the top-level API Key URL and sends no ChatGPT account header.
+
+`openai_fallback_proxy` must reference an existing entry in `proxies`. It is disabled
+by default and can be used without account or API Key mappings. Explicit upstream
+paths still must match the selected route: a path naming another service is never
+silently sent to OpenAI.
+
+For clients where `OPENAI_BASE_URL` selects the endpoint, launch with:
+
+```sh
+OPENAI_BASE_URL="http://127.0.0.1:7889/v1" codex
+```
+
+The proxy routes the token it receives; it does not infer the upstream from a key's
+prefix. It resolves configured provider identifiers against Codex configuration,
+or uses an explicit upstream override above.
+Keep upstream URLs pointed at the service provider, or use the explicit local
+wrapper described below; a plain local URL without an embedded HTTPS base is rejected.
+A client using a custom provider may require a command-line `base_url` override
+if it ignores `OPENAI_BASE_URL`.
+
+```sh
+.build/release/coding-agent-proxy --config config.yaml --check
+.build/release/coding-agent-proxy --config config.yaml
+```
+
+`--check` checks all configured credential sources, account mapping and duplicate
+credentials. Credentials are loaded once per request; configuration/key file
+changes affect subsequent requests. Environment changes require a process restart.
+For launchd, prefer key files because shell variables are not automatically inherited.
+
+Methods, bodies, queries, responses and SSE pass through without protocol or model
+conversion. The base URL includes the upstream API prefix, such as `/v1`;
+`/v1/responses` maps to `/responses` under it. Incoming `x-api-key` and `api-key`
+headers are stripped and are not alternative authentication methods. Each service
+must support the requested endpoint and Bearer authentication.
+
+## Explicit upstream URL in the path
+
+To configure a Codex provider directly, set its `base_url` to a local URL containing
+its real HTTPS API base:
+
+```toml
+[model_providers.ShareCoder]
+base_url = "http://127.0.0.1:7889/https://sharecoder.cc/v1"
+```
+
+Preserve the provider's other settings, including `env_key`. Use the actual API
+prefix required by that service; `/v1` is an example. Codex appending `/responses`
+produces a request to `/https://sharecoder.cc/v1/responses`, which this proxy forwards
+to `https://sharecoder.cc/v1/responses`. GET `/models` and other existing methods
+work the same way, with query parameters preserved. Bare HTTP upstreams are not supported.
+
+Bearer authentication still selects the configured credential and outgoing proxy.
+The explicit URL must match that credential's configured HTTPS host, port and API
+base path; requests to other hosts or outside the configured path are refused.
+This is not an unauthenticated arbitrary-URL proxy. When resolving a Codex provider
+whose base URL already uses the local `127.0.0.1` wrapper, the embedded HTTPS base
+is recovered automatically, preventing a forwarding loop. Ordinary local `/v1/...`
+requests remain supported. No `?base_url=` routing parameter is implemented.
+
+ChatGPT account authentication supports the same path form:
+`http://127.0.0.1:7889/https://chatgpt.com/backend-api/codex`.
+Keep the proxy's top-level `upstream_base_url` set to
+`https://chatgpt.com/backend-api/codex`. Requests matching `auth.json` use the
+account's configured proxy and send its access token and `ChatGPT-Account-Id`;
+an appended `/responses` goes to the ChatGPT Codex backend. This is a matched
+account route, separate from the optional unmatched-token OpenAI API fallback.
+
+## Run as a macOS service
+
+After building the release executable and creating `config.yaml`, install the
+current user's launchd service. Existing listeners are left running:
+
+```sh
+swift build -c release
+/usr/bin/python3 scripts/service.py install
+/usr/bin/python3 scripts/service.py status
+```
+
+The LaunchAgent `local.coding-agent-proxy` starts at login, runs in the background,
+and restarts after a process exits. The installer copies the release executable and
+startup script to `~/Library/Application Support/coding-agent-proxy`, avoiding
+launchd access failures in protected Documents/Desktop directories. On the first
+installation it also copies `config.yaml`; updates preserve that
+service configuration. Edit the copy in Application Support for live service
+configuration changes. Relative credential paths resolve from that directory;
+use an absolute path or `~/.codex/auth.json`. It runs as your user to access your
+Codex credentials; it is not a root daemon that starts before login.
+
+If the configured listen port is occupied, the supervisor waits without stopping
+any existing process. When the port becomes free, it starts the proxy. This lets
+you install the service during an active session and stop the manual instance
+later when convenient; the brief handover is not a zero-downtime migration.
+
+At startup, the script checks running Homebrew mihomo jobs under both
+`sh.brew.mihomo` and `homebrew.mxcl.mihomo` in user and system domains. It also
+recognizes an already running Homebrew mihomo executable. If none is running,
+it directly launches `$(brew --prefix)/opt/mihomo/bin/mihomo -d $(brew --prefix)/etc/mihomo`
+using the standard Apple Silicon or Intel Homebrew prefix. **It never calls
+`brew services start`.** Ensure that Homebrew mihomo and its configuration already
+exist. A failed child startup causes launchd to retry after its restart throttle.
+
+The supervisor stops only the mihomo child it started. An existing mihomo service
+remains independently managed. If a managed child exits, both owned processes are
+cleaned up and launchd restarts the supervisor. Existing external mihomo is checked
+at startup only and remains its original supervisor's responsibility. Do not start
+a second mihomo service while this service owns a standalone instance.
+
+```sh
+/usr/bin/python3 scripts/service.py update
+/usr/bin/python3 scripts/service.py restart
+/usr/bin/python3 scripts/service.py uninstall
+tail -F "$HOME/Library/Application Support/coding-agent-proxy/logs/service.stdout.log" \
+  "$HOME/Library/Application Support/coding-agent-proxy/logs/service.stderr.log"
+```
+
+Service output (including independently started mihomo output) is appended to these
+private files; launchd does not rotate them. Application request logs continue to
+use the rotating `logs/proxy.log` under the service directory. After code changes,
+rebuild and run `update` to stage the new executable and script without changing
+the running service or its registration. Then run `restart` when convenient to
+apply the update. `install` is for first installation and refuses an existing plist.
+Restarting interrupts active requests; schedule it outside an active coding session. Uninstall preserves configuration
+and logs in Application Support.
 
 ## Connect Codex
 
@@ -87,7 +291,7 @@ supports_websockets = false
 
 Keep your existing model settings and restart the client after changing its provider configuration. This setup uses HTTP/SSE; the proxy does not forward WebSockets. Remove or restore the `model_provider` setting to return to your previous provider. This project does not edit Codex configuration automatically.
 
-The credential file must contain `tokens.account_id` and `tokens.access_token`. Credentials stored only in a keychain and API-key-only credential files are not supported. The client is responsible for signing in, refreshing tokens, and saving them to the configured file.
+In ChatGPT mode, the credential file must contain `tokens.account_id` and `tokens.access_token`. Credentials stored only in a keychain and API-key-only `auth.json` files are not supported; configure API Key providers above. The client is responsible for signing in, refreshing tokens, and saving them to the configured file.
 
 The local paths `/responses`, `/v1/responses`, and `/backend-api/codex/responses` map to `/responses` under `upstream_base_url`. Subpaths such as `/responses/compact` and query parameters are preserved. Other paths are appended to the upstream base URL. There is no Chat Completions-to-Responses conversion or conversion of ChatGPT credentials into public API keys.
 
@@ -249,7 +453,7 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 - `Expect: 100-continue` returns HTTP 417. WebSocket Upgrade returns HTTP 426.
 - SSE is flushed at line boundaries or 16 KiB; ordinary responses use 16 KiB chunks. URLSession may add its own internal buffering.
 - `request_timeout_seconds` accepts 1–3600 seconds and configures both the upstream request timeout and the total resource timeout. A failure after streaming starts closes the connection without inserting a JSON error into the stream.
-- Local HTTP 401 means the Bearer token does not match the current credential file. HTTP 409 means the account header does not match. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body.
+- Local HTTP 401 means the Bearer token is missing/malformed, or no credential matches and OpenAI fallback is disabled. HTTP 409 means the account header does not match or the token matches multiple routes. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body.
 - If a mihomo listener refuses connections, confirm the effective profile contains it, its node name is valid, and the port is not occupied. If the exit changes unexpectedly, inspect the listener's node/group selection.
 - After rebuilding a running service, restart that process to use the new executable.
 
@@ -261,7 +465,7 @@ swift test
 python3 scripts/integration.py
 ```
 
-Swift tests cover configuration, identity validation, path mapping, HTTP framing, header filtering, logging, and early SSE delivery. The Python integration test uses synthetic credentials and local CONNECT probes to verify route selection, live reload, authentication rejection, missing mappings, logging, and failure without fallback. These tests do not call a real model or prove live provider connectivity.
+Swift tests cover configuration, identity validation, path mapping, HTTP framing, header filtering, logging, and early SSE delivery. The Python integration test uses synthetic credentials and local CONNECT probes to verify route selection, live reload, authentication rejection, missing mappings, logging, explicit OpenAI fallback through its designated proxy, and refusal without a configured fallback. These tests do not call a real model or prove live provider connectivity.
 
 | File | Responsibility |
 | --- | --- |

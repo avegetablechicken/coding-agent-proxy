@@ -2,6 +2,7 @@
 listen_port: 8787
 auth_file: "~/.codex/auth.json"
 upstream_base_url: "https://chatgpt.com/backend-api/codex"
+api_key_upstream_base_url: "https://api.openai.com/v1"
 request_timeout_seconds: 300
 
 # Explicit ports required; http CONNECT, https CONNECT and socks5 supported.
@@ -10,6 +11,30 @@ proxies:
   us: "http://127.0.0.1:8101"
   jp: "socks5://127.0.0.1:8102"
 
+# Optional: unmatched Bearer tokens go to api_key_upstream_base_url through this proxy.
+# Without this setting, unmatched credentials are refused.
+# openai_fallback_proxy: us
+
 accounts:
   "replace-with-us-account-id": us
   "replace-with-jp-account-id": jp
+
+# Optional API Key routes share this listener with auth.json account routing.
+# Bearer tokens must be distinct across the account and all providers.
+# api_key_providers:
+#   - name: openai
+#     # Uses Codex base_url, then top-level api_key_upstream_base_url.
+#     proxy: us  # Default outbound proxy for the official OpenAI API.
+#     # name resolves the Codex provider's env_key (openai -> OPENAI_API_KEY).
+#     # Optional api_key_env overrides the key source, not the provider URL.
+#   - name: openai
+#     api_key_env: SECOND_OPENAI_API_KEY
+#     proxy: jp  # Same provider, another key and proxy.
+#   - name: provider-a
+#     upstream_base_url: "https://a.example.com/v1"
+#     proxy: us
+#     api_key_file: "~/.config/coding-agent-proxy/provider-a.key"
+#   - api_key_env: PROVIDER_B_API_KEY
+#     # Resolve base_url from the Codex provider with this env_key.
+#     # Optional override: upstream_base_url: "https://b.example.com/v1"
+#     proxy: jp

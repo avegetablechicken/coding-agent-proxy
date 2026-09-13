@@ -11,16 +11,18 @@ struct CodingAgentProxy {
         }
         var args = Array(CommandLine.arguments.dropFirst())
         if args.contains("--help") || args.contains("-h") {
-            print("Usage: coding-agent-proxy [--config config.yaml] [--log-file path] [--check]\nBinds 127.0.0.1 only. --check validates YAML and the current account mapping without network requests.")
+            print("Usage: coding-agent-proxy [--config config.yaml] [--log-file path] [--check]\nBinds 127.0.0.1 only. --check validates YAML, credentials, account mapping and duplicate credentials without network requests.")
             return
         }
         var check = false
+        var printListenPort = false
         var path = "config.yaml"
         var logPath: String?
         while !args.isEmpty {
             let argument = args.removeFirst()
             switch argument {
             case "--check": check = true
+            case "--print-listen-port": printListenPort = true
             case "--config", "--log-file":
                 guard !args.isEmpty, !args[0].hasPrefix("--") else {
                     FileHandle.standardError.write(Data("Missing option value. Use --help.\n".utf8)); exit(2)
@@ -34,10 +36,13 @@ struct CodingAgentProxy {
         path = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath).standardizedFileURL.path
         do {
             let config = try Configuration.read(path)
+            if printListenPort {
+                print(config.listen_port)
+                return
+            }
             if check {
-                let identity = try config.identity()
-                _ = try config.proxyName(for: identity)
-                print("Configuration and current account mapping are valid. Proxy reachability was not tested.")
+                try config.checkCredentials()
+                print("Configuration, credential and route are valid. Proxy reachability was not tested.")
                 return
             }
             let logURL = logPath.map { URL(fileURLWithPath: NSString(string: $0).expandingTildeInPath).standardizedFileURL }
@@ -49,7 +54,7 @@ struct CodingAgentProxy {
             }
             try await server.start()
             print("coding-agent-proxy listening on http://127.0.0.1:\(config.listen_port)")
-            print("Configuration and auth_file are reloaded for every request.")
+            print("Configuration and credential files are reloaded for every request.")
             print("Request log: \(logURL.path)")
             logger.write("server_started", ["listen": "127.0.0.1:\(config.listen_port)", "log_file": logURL.path])
             await forwarder.logCurrentRoute()

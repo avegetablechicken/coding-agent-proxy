@@ -4,6 +4,7 @@ Uses only synthetic credentials and loopback sockets. Run after swift build.
 """
 import http.client
 import json
+import os
 import pathlib
 import socket
 import socketserver
@@ -74,7 +75,11 @@ accounts:
             login("account-a", "token-a")
             configure(a.server_address[1])
             subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config), "--check"], check=True)
-            process = subprocess.Popen([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            codex_home = temp / "codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text('[model_providers.reverse]\nenv_key = "REVERSE_TEST_KEY"\nbase_url = "https://provider-a.invalid/v1"\n')
+            test_environment = dict(os.environ, CODEX_HOME=str(codex_home), REVERSE_TEST_KEY="provider-key-one", EXTRA_KEY_A="extra-key-a", EXTRA_KEY_B="extra-key-b")
+            process = subprocess.Popen([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=test_environment)
             for _ in range(100):
                 try:
                     assert request(path="/health")[0] == 200
@@ -133,6 +138,110 @@ accounts:
             for secret in ["token-a", "token-b", "token-c", "secret-query", "secret-body"]:
                 assert secret not in raw_log, "Sensitive request data must not appear in logs"
             assert all(r.get("path") != "/health" for r in records)
+            key_file = temp / "provider.key"
+            key_file.write_text("provider-key-one\n")
+            config.write_text(f'''listen_port: {port}
+upstream_base_url: "https://api-provider.invalid/v1"
+request_timeout_seconds: 3
+proxies:
+  chosen: "http://127.0.0.1:{a.server_address[1]}"
+  unused: "http://127.0.0.1:{b.server_address[1]}"
+api_key_providers:
+- name: api-provider
+  upstream_base_url: "https://api-provider.invalid/v1"
+  proxy: chosen
+  api_key_file: "{key_file}"
+''')
+            auth.unlink()  # API Key mode must not depend on ChatGPT credentials.
+            subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config), "--check"], check=True)
+            previous_a, previous_b = len(a.requests), len(b.requests)
+            assert request(token="wrong")[0] == 401
+            assert len(a.requests) == previous_a and len(b.requests) == previous_b
+            assert request(token="provider-key-one", account="irrelevant", path="/v1/responses")[0] == 502
+            assert len(a.requests) > previous_a and len(b.requests) == previous_b
+            assert a.requests[-1].startswith(b"CONNECT api-provider.invalid:443 ")
+            assert b"provider-key-one" not in a.requests[-1]
+            key_file.write_text("provider-key-two\n")
+            assert request(token="provider-key-one")[0] == 401
+            assert request(token="provider-key-two")[0] == 502
+            key_file.unlink()
+            total = len(a.requests) + len(b.requests)
+            assert request(token="provider-key-two")[0] == 502
+            assert len(a.requests) + len(b.requests) == total
+            raw_log = log_path.read_text()
+            assert "provider-key-one" not in raw_log and "provider-key-two" not in raw_log
+            login("account-a", "chat-mixed-token")
+            key_file.write_text("provider-key-one")
+            key_b = temp / "provider-b.key"
+            key_b.write_text("provider-key-two")
+            config.write_text(f'''listen_port: {port}
+auth_file: "{auth}"
+upstream_base_url: "https://chatgpt-mixed.invalid/backend-api/codex"
+request_timeout_seconds: 3
+proxies:
+  us: "http://127.0.0.1:{a.server_address[1]}"
+  jp: "http://127.0.0.1:{b.server_address[1]}"
+accounts:
+  account-a: us
+api_key_providers:
+  - api_key_env: REVERSE_TEST_KEY
+    proxy: us
+  - name: provider-b
+    upstream_base_url: "https://provider-b.invalid/v1"
+    proxy: jp
+    api_key_file: "{key_b}"
+  - name: reverse
+    api_key_env: EXTRA_KEY_A
+    proxy: us
+  - name: reverse
+    api_key_env: EXTRA_KEY_B
+    proxy: jp
+''')
+            for token, probe, host in [("chat-mixed-token", a, "chatgpt-mixed.invalid"),
+                                        ("provider-key-one", a, "provider-a.invalid"),
+                                        ("provider-key-two", b, "provider-b.invalid"),
+                                        ("extra-key-a", a, "provider-a.invalid"),
+                                        ("extra-key-b", b, "provider-a.invalid")]:
+                count = len(probe.requests)
+                assert request(token=token, path="/v1/responses")[0] == 502
+                assert len(probe.requests) > count
+                assert probe.requests[-1].startswith(f"CONNECT {host}:443 ".encode())
+            total = len(a.requests) + len(b.requests)
+            assert request(token="unknown")[0] == 401
+            key_b.write_text("provider-key-one")
+            assert request(token="provider-key-one")[0] == 409
+            key_b.write_text("chat-mixed-token")
+            assert request(token="chat-mixed-token")[0] == 409
+            assert len(a.requests) + len(b.requests) == total
+            print("PASS: shared listener routes ChatGPT and two API providers; collisions rejected before CONNECT")
+            config.write_text(config.read_text() + "\nopenai_fallback_proxy: jp\n")
+            # Ambiguous known credentials must still be rejected with fallback enabled.
+            assert request(token="chat-mixed-token")[0] == 409
+            assert len(a.requests) + len(b.requests) == total
+            previous_a, previous_b = len(a.requests), len(b.requests)
+            assert request(token="unmatched-openai-key")[0] == 502
+            assert len(a.requests) == previous_a and len(b.requests) > previous_b
+            assert b.requests[-1].startswith(b"CONNECT api.openai.com:443 ")
+            assert b"unmatched-openai-key" not in b.requests[-1]
+            auth.unlink()
+            previous_b = len(b.requests)
+            assert request(token="another-unmatched-token")[0] == 502
+            assert len(b.requests) > previous_b
+            assert b.requests[-1].startswith(b"CONNECT api.openai.com:443 ")
+            total = len(a.requests) + len(b.requests)
+            assert request(token="unmatched-openai-key", path="/https://other.invalid/v1/responses")[0] == 502
+            assert len(a.requests) + len(b.requests) == total
+            config.write_text(config.read_text() + "\napi_key_upstream_base_url: https://fallback-default.invalid/v1\n")
+            previous_b = len(b.requests)
+            assert request(token="unmatched-openai-key")[0] == 502
+            assert len(b.requests) > previous_b
+            assert b.requests[-1].startswith(b"CONNECT fallback-default.invalid:443 ")
+            total = len(a.requests) + len(b.requests)
+            config.write_text(config.read_text().replace("openai_fallback_proxy: jp", "openai_fallback_proxy: missing"))
+            assert request(token="unmatched-openai-key")[0] == 502
+            assert len(a.requests) + len(b.requests) == total
+            print("PASS: unmatched credentials use only configured OpenAI fallback proxy; ambiguity and invalid proxy refused")
+            print("PASS: API Key mode, no auth.json dependency, designated CONNECT route, key rotation, missing-key refusal")
             print("PASS: startup route, per-request accounts/proxies, failures, request IDs, durations, credential/body/query exclusion")
             print("PASS: loopback listener, bearer validation, account mismatch, CONNECT routing, auth/YAML reload, unmapped account, invalid YAML, unavailable proxy without cross-proxy fallback")
     finally:

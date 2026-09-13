@@ -40,12 +40,27 @@ public actor Forwarder {
         var fields: [String: String] = [:]
         do {
             let config = try Configuration.read(configPath)
-            let identity = try identitySource.load(configuration: config)
-            fields["account_id"] = identity.accountID
-            let name = try config.proxyName(for: identity)
-            fields["proxy"] = name
-            fields["proxy_endpoint"] = config.proxies[name]
-            logger?.write("current_route", fields)
+            if !config.auth_file.isEmpty {
+                do {
+                    let identity = try self.identitySource.load(configuration: config)
+                    let name = try config.proxyName(for: identity)
+                    logger?.write("current_route", ["account_id": identity.accountID, "proxy": name,
+                                                   "proxy_endpoint": config.proxies[name]!])
+                } catch {
+                    logger?.write("route_unavailable", ["reason": (error as? ProxyError)?.message ?? "Cannot read current account route."])
+                }
+            }
+            for provider in config.providers {
+                var providerFields = ["provider": provider.name, "proxy": provider.proxy,
+                                      "proxy_endpoint": config.proxies[provider.proxy]!]
+                do {
+                    _ = try provider.resolveCredential(defaultUpstream: config.api_key_upstream_base_url)
+                    logger?.write("current_route", providerFields)
+                } catch {
+                    providerFields["reason"] = (error as? ProxyError)?.message ?? "Cannot read provider credential."
+                    logger?.write("route_unavailable", providerFields)
+                }
+            }
         } catch {
             fields["reason"] = (error as? ProxyError)?.message ?? "Cannot read current account route."
             logger?.write("route_unavailable", fields)
@@ -57,6 +72,23 @@ public actor Forwarder {
               let decoded = target.removingPercentEncoding,
               !decoded.contains("\\"), !decoded.split(separator: "/").contains(".."),
               !target.contains("#") else { throw ProxyError("Invalid request target.") }
+        if target.hasPrefix("/https://") || target.hasPrefix("/http://") {
+            guard let destination = URLComponents(string: String(target.dropFirst())),
+                  let configured = URLComponents(string: base),
+                  destination.scheme == "https", destination.user == nil, destination.password == nil,
+                  destination.fragment == nil,
+                  destination.host?.lowercased() == configured.host?.lowercased(),
+                  (destination.port ?? 443) == (configured.port ?? 443) else {
+                throw ProxyError("Explicit upstream must match the credential's configured HTTPS upstream.")
+            }
+            let root = configured.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let prefix = root.isEmpty ? "" : "/" + root
+            guard destination.path == prefix || destination.path.hasPrefix(prefix + "/"),
+                  let url = destination.url else {
+                throw ProxyError("Explicit upstream path is outside the configured API base.")
+            }
+            return url
+        }
         var suffix = target
         for prefix in ["/backend-api/codex", "/v1"] {
             if suffix.hasPrefix(prefix + "/") { suffix = String(suffix.dropFirst(prefix.count)); break }
@@ -70,7 +102,7 @@ public actor Forwarder {
     public static func forwardHeaders(_ headers: [String: String]) -> [String: String] {
         var excluded: Set<String> = ["host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                                      "te", "trailer", "transfer-encoding", "upgrade", "content-length",
-                                     "authorization", "chatgpt-account-id", "cookie", "accept-encoding"]
+                                     "authorization", "x-api-key", "api-key", "chatgpt-account-id", "cookie", "accept-encoding"]
         for name in (headers["connection"] ?? "").split(separator: ",") {
             excluded.insert(name.trimmingCharacters(in: .whitespaces).lowercased())
         }
@@ -109,18 +141,22 @@ public actor Forwarder {
             // Read each file once per request: routing and authorization share one identity snapshot.
             let config = try Configuration.read(configPath)
             guard config.listen_port == port else { throw ProxyError("listen_port changed; restart the server.") }
-            stage = "identity"
-            let identity = try identitySource.load(configuration: config)
-            fields["account_id"] = identity.accountID
             stage = "authorization"
-            guard incoming.headers["authorization"] == "Bearer \(identity.accessToken)" else {
-                status = 401
+            let route: CredentialRoute
+            do {
+                route = try config.resolveRoute(authorization: incoming.headers["authorization"]) {
+                    try self.identitySource.load(configuration: config)
+                }
+            } catch let rejection as RouteRejection {
+                status = rejection.status
                 outcome = "request_rejected"
-                fields["reason"] = "bearer_mismatch"
-                await client.error(status: 401, message: "Bearer token must match the current auth_file.")
+                fields["reason"] = rejection.message
+                await client.error(status: status, message: rejection.message)
                 return
             }
-            if let account = incoming.headers["chatgpt-account-id"], account != identity.accountID {
+            fields["account_id"] = route.accountID
+            fields["provider"] = route.provider
+            if let expected = route.accountID, let account = incoming.headers["chatgpt-account-id"], account != expected {
                 status = 409
                 outcome = "request_rejected"
                 fields["reason"] = "account_mismatch"
@@ -128,18 +164,20 @@ public actor Forwarder {
                 return
             }
             stage = "routing"
-            let name = try config.proxyName(for: identity)
+            let name = route.proxy
             let proxyURL = config.proxies[name]!
             fields["proxy"] = name
             fields["proxy_endpoint"] = proxyURL
             stage = "request"
-            let url = try Self.upstreamURL(base: config.upstream_base_url, target: incoming.target)
+            let url = try Self.upstreamURL(base: route.upstream, target: incoming.target)
             var request = URLRequest(url: url)
             request.httpMethod = incoming.method
             request.httpBody = incoming.body.isEmpty ? nil : incoming.body
             for (key, value) in Self.forwardHeaders(incoming.headers) { request.setValue(value, forHTTPHeaderField: key) }
-            request.setValue("Bearer \(identity.accessToken)", forHTTPHeaderField: "Authorization")
-            request.setValue(identity.accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+            request.setValue("Bearer \(route.token)", forHTTPHeaderField: "Authorization")
+            if let accountID = route.accountID {
+                request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+            }
             request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
             let session = try session(proxyURL: proxyURL, timeout: config.request_timeout_seconds)
             logger?.write("route_selected", fields)
