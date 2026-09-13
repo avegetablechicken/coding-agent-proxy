@@ -144,7 +144,7 @@ final class StreamingTests: XCTestCase {
         }
         let logURL = directory.appendingPathComponent("proxy.log")
         let logger = try RequestLogger(fileURL: logURL, console: nil)
-        await slot.install(Forwarder(configPath: config.path, port: port, logger: logger, sessionConfiguration: {
+        await slot.install(Forwarder(configuration: try Configuration.read(config.path), logger: logger, sessionConfiguration: {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.protocolClasses = [FixtureProtocol.self]
             return configuration

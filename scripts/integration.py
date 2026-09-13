@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline integration: real listener, URLSession CONNECT, hot reload, fail-closed routing.
+"""Offline integration: real listener, URLSession CONNECT, startup configuration, fail-closed routing.
 Uses only synthetic credentials and loopback sockets. Run after swift build.
 """
 import http.client
@@ -81,15 +81,21 @@ accounts:
             codex_home.mkdir()
             (codex_home / "config.toml").write_text('[model_providers.reverse]\nenv_key = "REVERSE_TEST_KEY"\nbase_url = "https://provider-a.invalid/v1"\n')
             test_environment = dict(os.environ, CODEX_HOME=str(codex_home), REVERSE_TEST_KEY="provider-key-one", EXTRA_KEY_A="extra-key-a", EXTRA_KEY_B="extra-key-b")
-            process = subprocess.Popen([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=test_environment)
-            for _ in range(100):
-                try:
-                    assert request(path="/health")[0] == 200
-                    break
-                except OSError:
-                    time.sleep(0.05)
-            else:
-                raise AssertionError("Listener did not start")
+            def restart():
+                nonlocal process
+                if process is not None:
+                    process.terminate()
+                    process.communicate(timeout=5)
+                process = subprocess.Popen([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=test_environment)
+                for _ in range(100):
+                    try:
+                        assert request(path="/health")[0] == 200
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+                else:
+                    raise AssertionError("Listener did not start")
+            restart()
             assert request(token="wrong")[0] == 401
             assert not a.requests and not b.requests
             result = request(path="/responses?private_query=secret-query")
@@ -109,31 +115,41 @@ accounts:
             assert total == len(a.requests) + len(b.requests)
             login("account-a", "token-a")
             configure(b.server_address[1])
-            previous_b = len(b.requests)
+            previous_a, previous_b = len(a.requests), len(b.requests)
             assert request()[0] == 502
-            assert len(b.requests) > previous_b, "YAML reload must change the chosen proxy"
+            assert len(a.requests) > previous_a and len(b.requests) == previous_b, "YAML changes must not affect the running process"
+            restart()
+            assert request()[0] == 502
+            assert len(b.requests) > previous_b, "Restart must load the changed YAML"
             with socket.socket() as unused:
                 unused.bind(("127.0.0.1", 0))
                 dead_port = unused.getsockname()[1]
             configure(dead_port)
+            restart()
             before_failure = len(a.requests) + len(b.requests)
             assert request()[0] == 502
             assert len(a.requests) + len(b.requests) == before_failure, "No fallback to another proxy"
             config.write_text("invalid: [")
             assert request()[0] == 502
+            assert len(a.requests) + len(b.requests) == before_failure
+            invalid = subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            assert invalid.returncode != 0, "Invalid YAML must fail at startup"
+            config.unlink()
+            assert request()[0] == 502
+            assert len(a.requests) + len(b.requests) == before_failure
             assert request(path="/health")[0] == 200
             log_path = temp / "logs/proxy.log"
             for _ in range(100):
                 records = [json.loads(line) for line in log_path.read_text().splitlines()]
                 terminal = [r for r in records if r["event"] in ("request_finished", "request_failed", "request_rejected")]
-                if len(terminal) == 9:
+                if len(terminal) == 11:
                     break
                 time.sleep(0.01)
-            assert len(terminal) == 9
+            assert len(terminal) == 11
             current = next(r for r in records if r["event"] == "current_route")
             assert current["account_id"] == "account-a" and current["proxy"] == "us"
             routes = [r for r in records if r["event"] == "route_selected"]
-            assert [(r["account_id"], r["proxy"]) for r in routes] == [("account-a", "us"), ("account-b", "jp"), ("account-a", "us"), ("account-a", "us")]
+            assert [(r["account_id"], r["proxy"]) for r in routes] == [("account-a", "us"), ("account-b", "jp")] + [("account-a", "us")] * 5
             assert all(r.get("request_id") and r.get("duration_ms") is not None for r in terminal)
             assert {r["status"] for r in terminal} == {"401", "409", "502"}
             raw_log = log_path.read_text()
@@ -154,6 +170,7 @@ api_key_providers:
   proxy: chosen
   api_key_file: "{key_file}"
 ''')
+            restart()
             auth.unlink()  # API Key mode must not depend on ChatGPT credentials.
             subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config), "--check"], check=True)
             previous_a, previous_b = len(a.requests), len(b.requests)
@@ -199,6 +216,7 @@ api_key_providers:
     api_key_env: EXTRA_KEY_B
     proxy: jp
 ''')
+            restart()
             for token, probe, host in [("chat-mixed-token", a, "chatgpt-mixed.invalid"),
                                         ("provider-key-one", a, "provider-a.invalid"),
                                         ("provider-key-two", b, "provider-b.invalid"),
@@ -215,16 +233,18 @@ api_key_providers:
                 assert probe.requests[-1].startswith(b"CONNECT developers.openai.com:443 ")
                 assert token.encode() not in probe.requests[-1]
             config.write_text(config.read_text() + "\nmcp_fallback_proxy: jp\n")
+            restart()
             for credential in [None, "unknown"]:
                 previous_a, previous_b = len(a.requests), len(b.requests)
                 assert request(token=credential, path="/mcp/openaiDeveloperDocs")[0] == 502
                 assert len(a.requests) == previous_a and len(b.requests) > previous_b
                 assert b.requests[-1].startswith(b"CONNECT developers.openai.com:443 ")
             config.write_text(config.read_text().replace("mcp_fallback_proxy: jp", "mcp_fallback_proxy: us"))
+            restart()
             previous_a, previous_b = len(a.requests), len(b.requests)
             assert request(token=None, path="/mcp/openaiDeveloperDocs")[0] == 502
             assert len(a.requests) > previous_a and len(b.requests) == previous_b
-            print("PASS: MCP follows matched ChatGPT/API routes, missing credentials use independent hot-reloaded fallback")
+            print("PASS: MCP follows matched ChatGPT/API routes, missing credentials use independent fallback loaded at restart")
             for path in ["/backend-api/wham/usage", "/backend-api/wham/rate-limit-reset-credits"]:
                 previous_a, previous_b = len(a.requests), len(b.requests)
                 assert request(token="chat-mixed-token", path=path, method="GET")[0] == 502
@@ -243,6 +263,7 @@ api_key_providers:
             assert len(a.requests) + len(b.requests) == total
             print("PASS: shared listener routes ChatGPT and two API providers; collisions rejected before CONNECT")
             config.write_text(config.read_text() + "\nopenai_fallback_proxy: jp\n")
+            restart()
             # Ambiguous known credentials must still be rejected with fallback enabled.
             assert request(token="chat-mixed-token")[0] == 409
             assert len(a.requests) + len(b.requests) == total
@@ -260,6 +281,7 @@ api_key_providers:
             assert request(token="unmatched-openai-key", path="/https://other.invalid/v1/responses")[0] == 502
             assert len(a.requests) + len(b.requests) == total
             config.write_text(config.read_text() + "\napi_key_upstream_base_url: https://fallback-default.invalid/v1\n")
+            restart()
             previous_b = len(b.requests)
             assert request(token="unmatched-openai-key")[0] == 502
             assert len(b.requests) > previous_b
@@ -267,11 +289,13 @@ api_key_providers:
             total = len(a.requests) + len(b.requests)
             config.write_text(config.read_text().replace("openai_fallback_proxy: jp", "openai_fallback_proxy: missing"))
             assert request(token="unmatched-openai-key")[0] == 502
-            assert len(a.requests) + len(b.requests) == total
+            assert len(a.requests) + len(b.requests) > total, "Running process retains valid startup configuration"
+            invalid = subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            assert invalid.returncode != 0
             print("PASS: unmatched credentials use only configured OpenAI fallback proxy; ambiguity and invalid proxy refused")
             print("PASS: API Key mode, no auth.json dependency, designated CONNECT route, key rotation, missing-key refusal")
             print("PASS: startup route, per-request accounts/proxies, failures, request IDs, durations, credential/body/query exclusion")
-            print("PASS: loopback listener, bearer validation, account mismatch, CONNECT routing, auth/YAML reload, unmapped account, invalid YAML, unavailable proxy without cross-proxy fallback")
+            print("PASS: loopback listener, bearer validation, account mismatch, CONNECT routing, credential refresh and YAML snapshot/restart, unmapped account, invalid YAML, unavailable proxy without cross-proxy fallback")
     finally:
         if process:
             process.terminate()

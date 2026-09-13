@@ -21,17 +21,15 @@ private final class NoRedirects: NSObject, URLSessionTaskDelegate, Sendable {
 public actor Forwarder {
     public static let docsMCPPath = "/mcp/openaiDeveloperDocs"
     public static let docsMCPUpstream = "https://developers.openai.com/mcp"
-    private let configPath: String
-    private let port: UInt16
+    private let config: Configuration
     private let identitySource: any IdentitySource
     private let logger: RequestLogger?
     private var sessions: [String: URLSession] = [:]
     private let sessionConfiguration: @Sendable () -> URLSessionConfiguration
 
-    public init(configPath: String, port: UInt16, identitySource: any IdentitySource = CodexIdentitySource(), logger: RequestLogger? = nil,
+    public init(configuration: Configuration, identitySource: any IdentitySource = CodexIdentitySource(), logger: RequestLogger? = nil,
                 sessionConfiguration: @escaping @Sendable () -> URLSessionConfiguration = { .ephemeral }) {
-        self.configPath = configPath
-        self.port = port
+        self.config = configuration
         self.identitySource = identitySource
         self.logger = logger
         self.sessionConfiguration = sessionConfiguration
@@ -39,33 +37,26 @@ public actor Forwarder {
 
     /// Startup snapshot only; each request still reads and logs its own routing decision.
     public func logCurrentRoute() {
-        var fields: [String: String] = [:]
-        do {
-            let config = try Configuration.read(configPath)
-            if !config.auth_file.isEmpty {
-                do {
-                    let identity = try self.identitySource.load(configuration: config)
-                    let name = try config.proxyName(for: identity)
-                    logger?.write("current_route", ["account_id": identity.accountID, "proxy": name,
-                                                   "proxy_endpoint": config.proxyEndpoint(for: name)])
-                } catch {
-                    logger?.write("route_unavailable", ["reason": (error as? ProxyError)?.message ?? "Cannot read current account route."])
-                }
+        if !config.auth_file.isEmpty {
+            do {
+                let identity = try self.identitySource.load(configuration: self.config)
+                let name = try config.proxyName(for: identity)
+                logger?.write("current_route", ["account_id": identity.accountID, "proxy": name,
+                                               "proxy_endpoint": config.proxyEndpoint(for: name)])
+            } catch {
+                logger?.write("route_unavailable", ["reason": (error as? ProxyError)?.message ?? "Cannot read current account route."])
             }
-            for provider in config.providers {
-                var providerFields = ["provider": provider.name, "proxy": provider.proxy,
-                                      "proxy_endpoint": config.proxyEndpoint(for: provider.proxy)]
-                do {
-                    _ = try provider.resolveCredential(defaultUpstream: config.api_key_upstream_base_url)
-                    logger?.write("current_route", providerFields)
-                } catch {
-                    providerFields["reason"] = (error as? ProxyError)?.message ?? "Cannot read provider credential."
-                    logger?.write("route_unavailable", providerFields)
-                }
+        }
+        for provider in config.providers {
+            var providerFields = ["provider": provider.name, "proxy": provider.proxy,
+                                  "proxy_endpoint": config.proxyEndpoint(for: provider.proxy)]
+            do {
+                _ = try provider.resolveCredential(defaultUpstream: config.api_key_upstream_base_url)
+                logger?.write("current_route", providerFields)
+            } catch {
+                providerFields["reason"] = (error as? ProxyError)?.message ?? "Cannot read provider credential."
+                logger?.write("route_unavailable", providerFields)
             }
-        } catch {
-            fields["reason"] = (error as? ProxyError)?.message ?? "Cannot read current account route."
-            logger?.write("route_unavailable", fields)
         }
     }
 
@@ -174,9 +165,7 @@ public actor Forwarder {
         }
         var started = false
         do {
-            // Read each file once per request: routing and authorization share one identity snapshot.
-            let config = try Configuration.read(configPath)
-            guard config.listen_port == port else { throw ProxyError("listen_port changed; restart the server.") }
+            // Routing configuration is immutable; credentials still refresh per request.
             stage = "authorization"
             let requestPath = String(incoming.target.split(separator: "?", maxSplits: 1).first ?? "")
             let docsMCP = requestPath == Self.docsMCPPath
@@ -186,7 +175,7 @@ public actor Forwarder {
             if docsMCP {
                 let selection = config.resolveMCPRoute(authorization: incoming.headers["authorization"],
                                                        accountID: incoming.headers["chatgpt-account-id"]) {
-                    try self.identitySource.load(configuration: config)
+                    try self.identitySource.load(configuration: self.config)
                 }
                 route = selection.credential
                 name = selection.proxy
@@ -195,7 +184,7 @@ public actor Forwarder {
             } else {
                 do {
                     let selected = try config.resolveRoute(authorization: incoming.headers["authorization"]) {
-                        try self.identitySource.load(configuration: config)
+                        try self.identitySource.load(configuration: self.config)
                     }
                     route = selected
                     name = selected.proxy

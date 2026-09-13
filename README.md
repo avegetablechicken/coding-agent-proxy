@@ -2,7 +2,7 @@
 
 A local macOS reverse proxy that selects an upstream service and outbound proxy by matching the request's Bearer credential.
 
-Supports **Codex with ChatGPT sign-in** and **Bearer routing to multiple API Key providers**. Routes live in YAML and are reloaded for every request. API protocols are passed through; Claude and Gemini protocol adapters are not implemented.
+Supports **Codex with ChatGPT sign-in** and **Bearer routing to multiple API Key providers**. Routes are loaded from YAML once at startup. API protocols are passed through; Claude and Gemini protocol adapters are not implemented.
 
 ```text
 Codex → coding-agent-proxy (127.0.0.1:8787)
@@ -15,7 +15,7 @@ Codex → coding-agent-proxy (127.0.0.1:8787)
 ## Features
 
 - **Per-account routing:** match `tokens.account_id` exactly to an explicit proxy mapping.
-- **Live configuration:** reread configuration and credentials for every request. In-flight requests retain their original identity and route.
+- **Startup configuration:** keep the loaded YAML in memory; edits require a restart. Credentials are still refreshed per request.
 - **Fail-closed forwarding:** reject missing mappings, invalid configuration, and unavailable proxies without switching accounts or falling back to a direct connection.
 - **Identity checks:** require a Bearer token matching the current `tokens.access_token`; validate `ChatGPT-Account-Id` when supplied.
 - **HTTP/SSE passthrough:** preserve request bodies, query parameters, upstream status codes, and streaming data while filtering hop-by-hop headers and rebuilding HTTP framing.
@@ -68,7 +68,7 @@ Replace each account placeholder with the corresponding `tokens.account_id` from
 .build/release/coding-agent-proxy --config config.yaml
 ```
 
-`--check` validates configuration, all credential sources, the current account mapping and duplicate credentials; it does not test network reachability. Account mappings, proxy endpoints, credentials, and timeouts take effect on the next request. Changing the listen port requires a restart. Stop with Ctrl-C or SIGTERM.
+`--check` validates configuration, all credential sources, the current account mapping and duplicate credentials; it does not test network reachability. Account mappings, proxy endpoints, timeouts, and other YAML changes require a restart. Credential file changes take effect on the next request. Stop with Ctrl-C or SIGTERM.
 
 ## Default upstreams
 
@@ -177,8 +177,8 @@ if it ignores `OPENAI_BASE_URL`.
 ```
 
 `--check` checks all configured credential sources, account mapping and duplicate
-credentials. Credentials are loaded once per request; configuration/key file
-changes affect subsequent requests. Environment changes require a process restart.
+credentials. Credentials are loaded once per request; key file changes affect
+subsequent requests. YAML configuration changes require a restart. Environment changes require a process restart.
 For launchd, prefer key files because shell variables are not automatically inherited.
 
 Methods, bodies, queries, responses and SSE pass through without protocol or model
@@ -256,7 +256,7 @@ and restarts after a process exits. The installer copies the release executable 
 startup script to `~/Library/Application Support/coding-agent-proxy`, avoiding
 launchd access failures in protected Documents/Desktop directories. On the first
 installation it also copies `config.yaml`; updates preserve that
-service configuration. Edit the copy in Application Support for live service
+service configuration. Edit the copy in Application Support and restart the service to apply
 configuration changes. Relative credential paths resolve from that directory;
 use an absolute path or `~/.codex/auth.json`. It runs as your user to access your
 Codex credentials; it is not a root daemon that starts before login.
@@ -385,7 +385,7 @@ An explicitly matched route using `none` also remains direct. The field is
 independent of `openai_fallback_proxy`; unknown MCP tokens never select the
 OpenAI API fallback. An invalid proxy name is a configuration error. Once a
 proxy is selected, connection failures do not retry through another proxy or
-directly. Changes to this field take effect on the next request.
+directly. Changes to this field require a service restart.
 
 The MCP destination is fixed, not an arbitrary URL forwarder. Model credentials,
 account IDs, cookies and other private request headers are removed before
@@ -559,7 +559,7 @@ swift test
 python3 scripts/integration.py
 ```
 
-Swift tests cover configuration, identity validation, path mapping, HTTP framing, header filtering, logging, and early SSE delivery. The Python integration test uses synthetic credentials and local CONNECT probes to verify route selection, live reload, authentication rejection, missing mappings, logging, explicit OpenAI fallback through its designated proxy, and refusal without a configured fallback. These tests do not call a real model or prove live provider connectivity.
+Swift tests cover configuration, identity validation, path mapping, HTTP framing, header filtering, logging, and early SSE delivery. The Python integration test uses synthetic credentials and local CONNECT probes to verify route selection, startup configuration snapshots and restarts, authentication rejection, missing mappings, logging, explicit OpenAI fallback through its designated proxy, and refusal without a configured fallback. These tests do not call a real model or prove live provider connectivity.
 
 | File | Responsibility |
 | --- | --- |

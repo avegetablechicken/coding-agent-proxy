@@ -66,7 +66,7 @@ final class UsageTests: XCTestCase {
           usage-account: none
         openai_fallback_proxy: none
         """.write(to: config, atomically: true, encoding: .utf8)
-        await router.install(Forwarder(configPath: config.path, port: port, sessionConfiguration: {
+        await router.install(Forwarder(configuration: try Configuration.read(config.path), sessionConfiguration: {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.protocolClasses = [UsageProtocol.self]
             return configuration

@@ -48,13 +48,13 @@ struct CodingAgentProxy {
             let logURL = logPath.map { URL(fileURLWithPath: NSString(string: $0).expandingTildeInPath).standardizedFileURL }
                 ?? URL(fileURLWithPath: path).deletingLastPathComponent().appendingPathComponent("logs/proxy.log")
             let logger = try RequestLogger(fileURL: logURL)
-            let forwarder = Forwarder(configPath: path, port: config.listen_port, logger: logger)
+            let forwarder = Forwarder(configuration: config, logger: logger)
             let server = try HTTPServer(port: config.listen_port) { request, client in
                 await forwarder.handle(request, client: client)
             }
             try await server.start()
             print("coding-agent-proxy listening on http://127.0.0.1:\(config.listen_port)")
-            print("Configuration and credential files are reloaded for every request.")
+            print("Configuration is loaded at startup; restart to apply configuration changes. Credentials refresh per request.")
             print("Request log: \(logURL.path)")
             logger.write("server_started", ["listen": "127.0.0.1:\(config.listen_port)", "log_file": logURL.path])
             await forwarder.logCurrentRoute()
