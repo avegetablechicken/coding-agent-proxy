@@ -321,7 +321,7 @@ public struct Configuration: Decodable, Sendable {
     }
 
     public func proxyName(for identity: Identity) throws -> String {
-        guard let name = accounts[identity.accountID] ?? account_fallback_proxy else {
+        guard let name = accounts[identity.accountID] ?? identity.usernames.lazy.compactMap({ accounts[$0] }).first ?? account_fallback_proxy else {
             throw ProxyError("Current account has no proxy mapping; forwarding refused.")
         }
         return name
@@ -421,10 +421,29 @@ public struct APIKeyProvider: Codable, Sendable {
 public struct Identity: Sendable {
     public let accountID: String
     public let accessToken: String
+    public let usernames: [String]
+
+    public init(accountID: String, accessToken: String, usernames: [String] = []) {
+        self.accountID = accountID
+        self.accessToken = accessToken
+        self.usernames = usernames
+    }
+
+    // Metadata comes only from the saved login, never from an incoming JWT.
+    private static func claims(_ token: String?) -> [String: Any] {
+        guard let token else { return [:] }
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return [:] }
+        var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        payload += String(repeating: "=", count: (4 - payload.utf8.count % 4) % 4)
+        guard let data = Data(base64Encoded: payload),
+              let claims = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+        return claims
+    }
 
     public static func parse(_ data: Data) throws -> Identity {
         struct Auth: Decodable {
-            struct Tokens: Decodable { let account_id: String; let access_token: String }
+            struct Tokens: Decodable { let account_id: String; let access_token: String; let id_token: String? }
             let tokens: Tokens
         }
         guard let auth = try? JSONDecoder().decode(Auth.self, from: data),
@@ -433,7 +452,16 @@ public struct Identity: Sendable {
               !auth.tokens.access_token.contains(where: { $0.isWhitespace || $0.isNewline }) else {
             throw ProxyError("auth_file requires nonempty tokens.account_id and tokens.access_token (ChatGPT login).")
         }
-        return Identity(accountID: auth.tokens.account_id, accessToken: auth.tokens.access_token)
+        let accessClaims = claims(auth.tokens.access_token)
+        let profile = accessClaims["https://api.openai.com/profile"] as? [String: Any] ?? [:]
+        let idClaims = claims(auth.tokens.id_token)
+        let usernames = ["email", "preferred_username", "name"].compactMap { key -> String? in
+            let value = (profile[key] as? String) ?? (accessClaims[key] as? String) ?? (idClaims[key] as? String)
+            guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
+            return value
+        }
+        return Identity(accountID: auth.tokens.account_id, accessToken: auth.tokens.access_token, usernames: usernames)
     }
 }
 

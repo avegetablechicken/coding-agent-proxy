@@ -57,6 +57,10 @@ final class StreamingTests: XCTestCase {
         try await exerciseStreaming(apiKeyMode: false)
     }
 
+    func testEmailRoutingPreservesAccountHeadersAndStreaming() async throws {
+        try await exerciseStreaming(apiKeyMode: false, emailRouting: true)
+    }
+
     func testAPIKeyAuthenticationHeadersAndStreaming() async throws {
         try await exerciseStreaming(apiKeyMode: true)
     }
@@ -95,7 +99,7 @@ final class StreamingTests: XCTestCase {
     }
 
     private func exerciseStreaming(apiKeyMode: Bool, explicitPath: Bool = false, direct: Bool = false,
-                                   mcpMethod: String? = nil, mcpCredential: String? = "test-token", mcpFallback: String? = nil) async throws {
+                                   mcpMethod: String? = nil, mcpCredential: String? = "test-token", mcpFallback: String? = nil, emailRouting: Bool = false) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -105,7 +109,9 @@ final class StreamingTests: XCTestCase {
         defer { server.stop() }
         let port = try XCTUnwrap(server.port)
         let auth = directory.appendingPathComponent("auth.json")
-        try Data(#"{"tokens":{"account_id":"fixture","access_token":"test-token"}}"#.utf8).write(to: auth)
+        let payload = Data(#"{"email":"you@example.com"}"#.utf8).base64EncodedString()
+        let tokens = ["account_id": "fixture", "access_token": "test-token", "id_token": "e30.\(payload).fixture"]
+        try JSONSerialization.data(withJSONObject: ["tokens": tokens]).write(to: auth)
         let config = directory.appendingPathComponent("config.yaml")
         try """
         listen_port: \(port)
@@ -115,7 +121,7 @@ final class StreamingTests: XCTestCase {
         proxies:
           test: "http://127.0.0.1:1"
         accounts:
-          fixture: test
+          "\(emailRouting ? "you@example.com" : "fixture")": test
         """.write(to: config, atomically: true, encoding: .utf8)
         if apiKeyMode {
             let keyFile = directory.appendingPathComponent("api-key")

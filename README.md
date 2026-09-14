@@ -29,7 +29,7 @@ proxies:
 
 routing:
   account:
-    "replace-with-account-id": jp
+    "you@example.com": jp
   api_key:
     - name: openai
       api_key_env: OPENAI_API_KEY
@@ -50,10 +50,20 @@ reserved value `none` selects direct access, and a proxy alias may also map to
 `none`. Proxy URLs require explicit ports. The service clears inherited HTTP/SOCKS
 proxy environment variables and disables system/PAC proxy discovery for direct routes.
 
-`routing.account` maps `tokens.account_id` from `auth.json` to proxy names. A
-request must match the saved access token; a supplied account header must also
-match. Credentials stored only in a keychain are unsupported. Codex remains
-responsible for login and token refresh.
+`routing.account` accepts a login email or username as the key, for example
+`"you@example.com": jp`. Account IDs remain supported. Matching is exact and
+tries account ID first, then `email`, `preferred_username`, and `name` from the
+saved login tokens. For each field, the access token's OpenAI profile takes
+priority over its top-level claims, then the ID token's claims. Use email when
+possible; display names may be shared by multiple accounts. If no key matches,
+`account_fallback` applies as before.
+
+A request must still match the saved access token; a supplied account header
+must match the actual account ID, even when routing by email. Username metadata
+is read from `auth.json` on each request, so login changes take effect immediately.
+Missing or malformed token metadata leaves ID routing and fallback available.
+Credentials stored only in a keychain are unsupported. Codex remains responsible
+for login and token refresh.
 
 `routing.api_key` is a list so multiple keys can share a provider but select
 different proxies. Each entry has `proxy`, a `name` and/or `api_key_env`, and

@@ -17,7 +17,7 @@ proxies:
 
 routing:
   account:
-    "replace-with-us-account-id": us
+    "you@example.com": us
     "replace-with-jp-account-id": jp
 
   # Optional: uses env_key from the named Codex provider (openai -> OPENAI_API_KEY).
