@@ -93,6 +93,41 @@ matches remain errors for model/usage requests; public MCP uses its own fallback
 Once an outbound proxy is selected, connection/authentication failures do not switch
 proxies or silently fall back to direct access.
 
+### Ordered proxy candidates
+
+Every routing proxy value accepts either a name or an ordered list, including
+account/API Key routes and all three fallback fields:
+
+```yaml
+routing:
+  account:
+    "account-id": [jp, us]
+  api_key:
+    - name: openai
+      proxy: [us, jp]
+  account_fallback: [jp, us]
+  api_key_fallback: [us, jp, none]
+  mcp_fallback: [jp, none]
+```
+
+A scalar preserves existing behavior without probing. For a list, each request
+checks candidates sequentially and stops at the first available one. Probes use
+an unauthenticated `HEAD /` to the actual upstream HTTPS origin (including its
+port), without model tokens, account headers, request bodies or query parameters.
+A candidate is available when TLS/HTTP succeeds with a status from 200–499 other
+than 407; 401/403/404/405 can establish transport reachability without credentials.
+This does not verify model permissions or guarantee that the subsequent API call
+will succeed. Redirects are not followed. Each probe is limited to 5 seconds or
+`request_timeout_seconds`, whichever is lower. Selection is repeated per request.
+
+Empty lists and unknown proxy names are rejected at startup. `none` is probed as
+a direct connection only when explicitly included. If every candidate fails,
+the request returns 502 without sending its business payload. Once selected,
+the actual request is sent only once: an API/streaming failure does not replay it
+through another candidate. The next request starts selection from the first
+candidate again. Logs include a redacted `proxy_probe` event for each attempted
+candidate and the selected proxy in `route_selected`.
+
 YAML is loaded once at startup. Account mappings, upstreams, proxy credentials,
 fallbacks and timeouts require a restart after editing. `auth.json` and API Key
 files are read per request so credential rotation can take effect without restart.

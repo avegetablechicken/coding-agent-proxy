@@ -170,7 +170,7 @@ final class APIKeyTests: XCTestCase {
             let route = try config.resolveRoute(authorization: "Bearer test-openai-key")
             XCTAssertEqual(route.upstream, "https://api.openai.com/v1")
             XCTAssertEqual(route.proxy, "selected")
-            XCTAssertEqual(config.proxies[route.proxy], "http://127.0.0.1:8118")
+            XCTAssertEqual(config.proxies[route.proxy.candidates[0]], "http://127.0.0.1:8118")
             XCTAssertNil(route.accountID)
             let overridden = try Configuration.parse(text + "\n  upstream_base_url: https://custom.example.com/v1")
             XCTAssertEqual(try overridden.resolveRoute(authorization: "Bearer test-openai-key").upstream,
@@ -214,7 +214,7 @@ final class APIKeyTests: XCTestCase {
         for (key, name, proxy) in [("key-a", "a", "us"), ("key-b", "b", "jp")] {
             let route = try config.resolveRoute(authorization: "Bearer \(key)", loadIdentity: identity)
             XCTAssertEqual(route.provider, name)
-            XCTAssertEqual(route.proxy, proxy)
+            XCTAssertEqual(route.proxy.candidates, [proxy])
             XCTAssertEqual(route.upstream, "https://\(name).example.com/v1")
             XCTAssertNil(route.accountID)
         }

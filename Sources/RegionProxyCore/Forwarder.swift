@@ -25,10 +25,13 @@ public actor Forwarder {
     private let identitySource: any IdentitySource
     private let logger: RequestLogger?
     private var sessions: [String: URLSession] = [:]
+    private let proxyProbe: (@Sendable (String, URL, Double) async throws -> Bool)?
     private let sessionConfiguration: @Sendable () -> URLSessionConfiguration
 
     public init(configuration: Configuration, identitySource: any IdentitySource = CodexIdentitySource(), logger: RequestLogger? = nil,
-                sessionConfiguration: @escaping @Sendable () -> URLSessionConfiguration = { .ephemeral }) {
+                sessionConfiguration: @escaping @Sendable () -> URLSessionConfiguration = { .ephemeral },
+                proxyProbe: (@Sendable (String, URL, Double) async throws -> Bool)? = nil) {
+        self.proxyProbe = proxyProbe
         self.config = configuration
         self.identitySource = identitySource
         self.logger = logger
@@ -41,15 +44,15 @@ public actor Forwarder {
             do {
                 let identity = try self.identitySource.load(configuration: self.config)
                 let name = try config.proxyName(for: identity)
-                logger?.write("current_route", ["account_id": identity.accountID, "proxy": name,
-                                               "proxy_endpoint": Configuration.redactedProxyEndpoint(config.proxyEndpoint(for: name))])
+                logger?.write("current_route", ["account_id": identity.accountID, "proxy": name.label,
+                                               "proxy_endpoint": name.candidates.map { Configuration.redactedProxyEndpoint(config.proxyEndpoint(for: $0)) }.joined(separator: ", ")])
             } catch {
                 logger?.write("route_unavailable", ["reason": (error as? ProxyError)?.message ?? "Cannot read current account route."])
             }
         }
         for provider in config.providers {
-            var providerFields = ["provider": provider.name, "proxy": provider.proxy,
-                                  "proxy_endpoint": Configuration.redactedProxyEndpoint(config.proxyEndpoint(for: provider.proxy))]
+            var providerFields = ["provider": provider.name, "proxy": provider.proxy.label,
+                                  "proxy_endpoint": provider.proxy.candidates.map { Configuration.redactedProxyEndpoint(config.proxyEndpoint(for: $0)) }.joined(separator: ", ")]
             do {
                 _ = try provider.resolveCredential(defaultUpstream: config.api_key_upstream_base_url)
                 logger?.write("current_route", providerFields)
@@ -190,7 +193,7 @@ public actor Forwarder {
             let docsMCP = requestPath == Self.docsMCPPath
             let accountQuery = Self.accountQuerySuffix(target: incoming.target) != nil
             let route: CredentialRoute?
-            let name: String
+            let name: ProxyChoice
             if docsMCP {
                 let selection = config.resolveMCPRoute(authorization: incoming.headers["authorization"],
                                                        accountID: incoming.headers["chatgpt-account-id"]) {
@@ -225,9 +228,7 @@ public actor Forwarder {
                 return
             }
             stage = "routing"
-            let proxyURL = config.proxyEndpoint(for: name)
-            fields["proxy"] = name
-            fields["proxy_endpoint"] = Configuration.redactedProxyEndpoint(proxyURL)
+            fields["proxy"] = name.label
             stage = "request"
             if requestPath.hasPrefix("/mcp/"), !docsMCP {
                 status = 404
@@ -283,6 +284,11 @@ public actor Forwarder {
                 }
             }
             request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+            stage = "proxy_selection"
+            let selected = try await selectProxy(name, destination: url, fields: fields)
+            let proxyURL = config.proxyEndpoint(for: selected)
+            fields["proxy"] = selected
+            fields["proxy_endpoint"] = Configuration.redactedProxyEndpoint(proxyURL)
             let session = try session(proxyURL: proxyURL, timeout: config.request_timeout_seconds)
             logger?.write("route_selected", fields)
             stage = "upstream_connect"
@@ -341,6 +347,43 @@ public actor Forwarder {
                 await client.error(status: 502, message: message)
             }
         }
+    }
+
+    private func selectProxy(_ selection: ProxyChoice, destination: URL, fields: [String: String]) async throws -> String {
+        guard selection.isList else { return selection.candidates[0] }
+        let timeout = min(5, config.request_timeout_seconds)
+        var origin = URLComponents(url: destination, resolvingAgainstBaseURL: false)!
+        origin.path = "/"
+        origin.query = nil
+        origin.fragment = nil
+        let probeURL = origin.url!
+        for name in selection.candidates {
+            try Task.checkCancellation()
+            let endpoint = config.proxyEndpoint(for: name)
+            var available = false
+            do {
+                if let proxyProbe {
+                    available = try await proxyProbe(endpoint, probeURL, timeout)
+                } else {
+                    var request = URLRequest(url: probeURL)
+                    request.httpMethod = "HEAD"
+                    let probeSession = try session(proxyURL: endpoint, timeout: timeout)
+                    let (_, response) = try await probeSession.data(for: request)
+                    if let http = response as? HTTPURLResponse {
+                        available = (200..<500).contains(http.statusCode) && http.statusCode != 407
+                    }
+                }
+            } catch {
+                if Task.isCancelled || error is CancellationError { throw CancellationError() }
+            }
+            var event = fields
+            event["proxy"] = name
+            event["proxy_endpoint"] = Configuration.redactedProxyEndpoint(endpoint)
+            event["available"] = available ? "true" : "false"
+            logger?.write("proxy_probe", event)
+            if available { return name }
+        }
+        throw ProxyError("No available outbound proxy in the configured list.")
     }
 
     private static func chunk(_ data: Data) -> Data {

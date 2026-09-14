@@ -15,11 +15,11 @@ public struct Configuration: Decodable, Sendable {
     public let api_key_upstream_base_url: String
     public let request_timeout_seconds: Double
     public let proxies: [String: String]
-    public let accounts: [String: String]
+    public let accounts: [String: ProxyChoice]
     public let providers: [APIKeyProvider]
-    public let account_fallback_proxy: String?
-    public let openai_fallback_proxy: String?
-    public let mcp_fallback_proxy: String?
+    public let account_fallback_proxy: ProxyChoice?
+    public let openai_fallback_proxy: ProxyChoice?
+    public let mcp_fallback_proxy: ProxyChoice?
 
     enum CodingKeys: String, CodingKey {
         case base_url, routing, listen_port, auth_file, account_upstream_base_url, upstream_base_url, request_timeout_seconds, proxies, accounts, api_key_providers, openai_fallback_proxy, api_key_upstream_base_url, mcp_fallback_proxy
@@ -31,11 +31,11 @@ public struct Configuration: Decodable, Sendable {
     }
 
     private struct Routing: Codable {
-        let account: [String: String]?
+        let account: [String: ProxyChoice]?
         let api_key: [APIKeyProvider]?
-        let account_fallback: String?
-        let api_key_fallback: String?
-        let mcp_fallback: String?
+        let account_fallback: ProxyChoice?
+        let api_key_fallback: ProxyChoice?
+        let mcp_fallback: ProxyChoice?
     }
 
     public init(from decoder: Decoder) throws {
@@ -58,11 +58,11 @@ public struct Configuration: Decodable, Sendable {
         api_key_upstream_base_url = try urls?.api_key ?? values.decodeIfPresent(String.self, forKey: .api_key_upstream_base_url) ?? "https://api.openai.com/v1"
         request_timeout_seconds = try values.decode(Double.self, forKey: .request_timeout_seconds)
         proxies = try values.decodeIfPresent([String: String].self, forKey: .proxies) ?? [:]
-        accounts = try routing?.account ?? values.decodeIfPresent([String: String].self, forKey: .accounts) ?? [:]
+        accounts = try routing?.account ?? values.decodeIfPresent([String: ProxyChoice].self, forKey: .accounts) ?? [:]
         providers = try routing?.api_key ?? values.decodeIfPresent([APIKeyProvider].self, forKey: .api_key_providers) ?? []
         account_fallback_proxy = routing?.account_fallback
-        openai_fallback_proxy = try routing?.api_key_fallback ?? values.decodeIfPresent(String.self, forKey: .openai_fallback_proxy)
-        mcp_fallback_proxy = try routing?.mcp_fallback ?? values.decodeIfPresent(String.self, forKey: .mcp_fallback_proxy)
+        openai_fallback_proxy = try routing?.api_key_fallback ?? values.decodeIfPresent(ProxyChoice.self, forKey: .openai_fallback_proxy)
+        mcp_fallback_proxy = try routing?.mcp_fallback ?? values.decodeIfPresent(ProxyChoice.self, forKey: .mcp_fallback_proxy)
     }
 
     public static func read(_ path: String) throws -> Configuration {
@@ -132,21 +132,21 @@ public struct Configuration: Decodable, Sendable {
             if value != "none" { _ = try Self.proxyConfiguration(value) }
         }
         for (id, name) in result.accounts {
-            guard !id.isEmpty, (name == "none" || result.proxies[name] != nil) else {
+            guard !id.isEmpty, name.isValid(in: result.proxies) else {
                 throw ProxyError("Every account must select an existing proxy name or none.")
             }
         }
         for (name, value) in [("account_fallback", result.account_fallback_proxy),
                               ("api_key_fallback", result.openai_fallback_proxy), ("mcp_fallback", result.mcp_fallback_proxy)] {
             if let fallback = value {
-                guard !fallback.isEmpty, fallback == "none" || result.proxies[fallback] != nil else {
+                guard fallback.isValid(in: result.proxies) else {
                     throw ProxyError("routing.\(name) must select an existing proxy or none.")
                 }
             }
         }
         for provider in result.providers {
             try validateUpstream(provider.upstream_base_url ?? result.api_key_upstream_base_url)
-            guard !provider.name.isEmpty, (provider.proxy == "none" || result.proxies[provider.proxy] != nil),
+            guard !provider.name.isEmpty, provider.proxy.isValid(in: result.proxies),
                   !(provider.api_key_env != nil && provider.api_key_file != nil),
                   provider.api_key_env.map({ !$0.isEmpty }) ?? true,
                   provider.api_key_file.map({ !$0.isEmpty }) ?? true else {
@@ -289,10 +289,10 @@ public struct Configuration: Decodable, Sendable {
     /// Public documentation requests can proceed without a model credential.
     /// Only an exact, unambiguous credential match inherits a model route.
     public func resolveMCPRoute(authorization: String?, accountID: String? = nil,
-                                loadIdentity: (() throws -> Identity)? = nil) -> (credential: CredentialRoute?, proxy: String) {
+                                loadIdentity: (() throws -> Identity)? = nil) -> (credential: CredentialRoute?, proxy: ProxyChoice) {
         if let route = try? resolveRoute(authorization: authorization, allowOpenAIFallback: false, loadIdentity: loadIdentity),
            accountID == nil || accountID == route.accountID,
-           route.proxy == "none" || proxies[route.proxy] != nil {
+           route.proxy.isValid(in: proxies) {
             return (route, route.proxy)
         }
         return (nil, mcp_fallback_proxy ?? "none")
@@ -320,7 +320,7 @@ public struct Configuration: Decodable, Sendable {
         return try Identity.parse(data)
     }
 
-    public func proxyName(for identity: Identity) throws -> String {
+    public func proxyName(for identity: Identity) throws -> ProxyChoice {
         guard let name = accounts[identity.accountID] ?? identity.usernames.lazy.compactMap({ accounts[$0] }).first ?? account_fallback_proxy else {
             throw ProxyError("Current account has no proxy mapping; forwarding refused.")
         }
@@ -331,7 +331,7 @@ public struct Configuration: Decodable, Sendable {
 public struct APIKeyProvider: Codable, Sendable {
     public let upstream_base_url: String?
     public var name: String { providerID ?? api_key_env ?? "" }
-    public let proxy: String
+    public let proxy: ProxyChoice
     public let api_key_env: String?
     public let api_key_file: String?
     public let providerID: String?
@@ -359,7 +359,7 @@ public struct APIKeyProvider: Codable, Sendable {
             throw ProxyError("Specify a nonempty name or api_key_env.")
         }
         providerID = explicitName
-        proxy = try values.decode(String.self, forKey: .proxy)
+        proxy = try values.decode(ProxyChoice.self, forKey: .proxy)
         upstream_base_url = try values.decodeIfPresent(String.self, forKey: .upstream_base_url)
         api_key_file = try values.decodeIfPresent(String.self, forKey: .api_key_file)
         api_key_env = explicitEnv
@@ -469,7 +469,7 @@ public struct CredentialRoute: Sendable {
     public let token: String
     public let accountID: String?
     public let provider: String?
-    public let proxy: String
+    public let proxy: ProxyChoice
     public let upstream: String
 }
 

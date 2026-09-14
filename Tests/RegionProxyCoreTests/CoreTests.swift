@@ -102,7 +102,7 @@ final class CoreTests: XCTestCase {
         for token in ["known", "unknown"] {
             let route = try config.resolveRoute(authorization: "Bearer \(token)", loadIdentity: identity)
             XCTAssertEqual(route.proxy, "none")
-            XCTAssertEqual(config.proxyEndpoint(for: route.proxy), "none")
+            XCTAssertEqual(config.proxyEndpoint(for: route.proxy.candidates[0]), "none")
         }
         let alias = try Configuration.parse(yaml.replacingOccurrences(of: "http://127.0.0.1:8101", with: "none"))
         XCTAssertEqual(alias.proxyEndpoint(for: "us"), "none")

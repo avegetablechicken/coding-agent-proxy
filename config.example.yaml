@@ -40,3 +40,11 @@ routing:
   # api_key_fallback: us
   # Public MCP: no matching credential route; omitted/null/none means direct.
   # mcp_fallback: jp
+
+# Any routing proxy value also accepts ordered candidates, for example:
+# routing.account.<account-id>: [jp, us]
+# routing.api_key[].proxy: [us, jp]
+# routing.account_fallback: [jp, us]
+# routing.api_key_fallback: [us, jp, none]
+# routing.mcp_fallback: [jp, none]
+# Lists probe the upstream origin before sending each request. All failed -> 502.
