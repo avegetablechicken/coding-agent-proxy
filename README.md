@@ -604,3 +604,7 @@ When the service environment lacks a configured API Key variable, read that expo
 variable using the user's login/interactive zsh, bash or sh. Process variables take
 priority. Lookup is limited to 3 seconds and startup output is discarded.
 Already matched ChatGPT requests do not launch a shell for unrelated API keys.
+
+ChatGPT account requests support a shared `/backend-api` upstream root. Model
+requests use `/codex`; plugin, usage and other official backend paths retain
+their original namespaces instead of being appended below `/codex`.

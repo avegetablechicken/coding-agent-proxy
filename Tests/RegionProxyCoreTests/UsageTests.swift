@@ -61,7 +61,7 @@ final class UsageTests: XCTestCase {
         listen_port: \(port)
         request_timeout_seconds: 10
         auth_file: "\(auth.path)"
-        upstream_base_url: https://usage-fixture.invalid/backend-api/codex
+        upstream_base_url: https://usage-fixture.invalid/backend-api
         accounts:
           usage-account: none
         openai_fallback_proxy: none

@@ -168,6 +168,34 @@ final class CoreTests: XCTestCase {
         }
     }
 
+    func testChatGPTBackendPathsKeepOfficialPrefix() throws {
+        let base = "https://chatgpt.com/backend-api/codex"
+        for path in ["/backend-api/ps/plugins/installed", "/backend-api/codex/analytics-events/events", "/backend-api/codex/responses"] {
+            XCTAssertEqual(try Forwarder.upstreamURL(base: base, target: path + "?test=a%2Fb", chatGPTBackend: true).absoluteString,
+                           "https://chatgpt.com" + path + "?test=a%2Fb")
+        }
+        XCTAssertEqual(try Forwarder.upstreamURL(base: base, target: "/v1/responses", chatGPTBackend: true).absoluteString, base + "/responses")
+        for path in ["/backend-api/../admin", "/backend-api/%2e%2e/admin", "//other.invalid/backend-api/ps/plugins/installed"] {
+            XCTAssertThrowsError(try Forwarder.upstreamURL(base: base, target: path, chatGPTBackend: true))
+        }
+    }
+
+
+    func testSharedAccountBackendRootRoutesAllNamespaces() throws {
+        let base = "https://chatgpt.com/backend-api"
+        for (target, path) in [("/v1/responses", "/codex/responses"), ("/models", "/codex/models"),
+                               ("/codex/responses", "/codex/responses"), ("/backend-api/codex/responses", "/codex/responses"),
+                               ("/backend-api/ps/plugins/installed", "/ps/plugins/installed"),
+                               ("/backend-api/wham/usage", "/wham/usage") ] {
+            XCTAssertEqual(try Forwarder.upstreamURL(base: base, target: target + "?q=a%2Fb", chatGPTBackend: true).absoluteString,
+                           base + path + "?q=a%2Fb")
+        }
+        XCTAssertEqual(try Forwarder.accountQueryURL(base: base, target: "/backend-api/wham/usage").absoluteString, base + "/wham/usage")
+        XCTAssertEqual(try Forwarder.upstreamURL(base: base, target: "/https://chatgpt.com/backend-api/ps/plugins/installed", chatGPTBackend: true).absoluteString,
+                       base + "/ps/plugins/installed")
+    }
+
+
     func testHeaderFiltering() {
         let result = Forwarder.forwardHeaders(["connection": "x-private, keep-alive", "x-private": "hidden", "authorization": "secret", "host": "localhost", "content-length": "5", "x-request-id": "abc", "content-type": "application/json"])
         XCTAssertEqual(result, ["x-request-id": "abc", "content-type": "application/json"])

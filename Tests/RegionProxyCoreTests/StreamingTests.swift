@@ -110,7 +110,7 @@ final class StreamingTests: XCTestCase {
         try """
         listen_port: \(port)
         auth_file: "\(auth.path)"
-        upstream_base_url: "https://stream-fixture.invalid/backend-api/codex"
+        upstream_base_url: "https://stream-fixture.invalid/backend-api"
         request_timeout_seconds: 10
         proxies:
           test: "http://127.0.0.1:1"

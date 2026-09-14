@@ -60,11 +60,30 @@ public actor Forwarder {
         }
     }
 
-    public static func upstreamURL(base: String, target: String) throws -> URL {
+    public static func upstreamURL(base: String, target: String, chatGPTBackend: Bool = false) throws -> URL {
         guard target.hasPrefix("/"), !target.hasPrefix("//"),
               let decoded = target.removingPercentEncoding,
               !decoded.contains("\\"), !decoded.split(separator: "/").contains(".."),
               !target.contains("#") else { throw ProxyError("Invalid request target.") }
+        if chatGPTBackend, var backend = URLComponents(string: base),
+           ["backend-api", "backend-api/codex"].contains(backend.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))) {
+            backend.path = "/backend-api"
+            guard let root = backend.string else { throw ProxyError("Invalid ChatGPT backend URL.") }
+            if target.hasPrefix("/https://") || target.hasPrefix("/http://") {
+                return try upstreamURL(base: root, target: target)
+            }
+            let destination: String
+            if target.hasPrefix("/backend-api/") {
+                backend.path = ""
+                guard let origin = backend.string else { throw ProxyError("Invalid ChatGPT origin.") }
+                destination = origin + target
+            } else {
+                let suffix = target.hasPrefix("/v1/") ? String(target.dropFirst(3)) : target
+                destination = root + (suffix.hasPrefix("/codex/") ? "" : "/codex") + suffix
+            }
+            guard let url = URL(string: destination) else { throw ProxyError("Invalid ChatGPT request URL.") }
+            return url
+        }
         if target.hasPrefix("/https://") || target.hasPrefix("/http://") {
             guard let destination = URLComponents(string: String(target.dropFirst())),
                   let configured = URLComponents(string: base),
@@ -106,10 +125,10 @@ public actor Forwarder {
 
     public static func accountQueryURL(base: String, target: String) throws -> URL {
         guard let suffix = accountQuerySuffix(target: target),
-              var backend = URLComponents(string: base), backend.path.hasSuffix("/backend-api/codex") else {
-            throw ProxyError("Account queries require a ChatGPT upstream ending in /backend-api/codex.")
+              var backend = URLComponents(string: base), ["/backend-api", "/backend-api/codex"].contains(backend.path) else {
+            throw ProxyError("Account queries require a ChatGPT /backend-api upstream.")
         }
-        backend.path = String(backend.path.dropLast("/codex".count))
+        backend.path = "/backend-api"
         guard let root = backend.string else { throw ProxyError("Invalid ChatGPT backend URL.") }
         if target.hasPrefix("/https://") || target.hasPrefix("/http://") {
             let url = try upstreamURL(base: root, target: target)
@@ -248,7 +267,7 @@ public actor Forwarder {
                 url = destination
             } else {
                 guard let route else { throw ProxyError("Missing model route.") }
-                url = try Self.upstreamURL(base: route.upstream, target: incoming.target)
+                url = try Self.upstreamURL(base: route.upstream, target: incoming.target, chatGPTBackend: route.accountID != nil)
             }
             var request = URLRequest(url: url)
             request.httpMethod = incoming.method
