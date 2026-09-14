@@ -11,24 +11,27 @@ struct CodingAgentProxy {
         }
         var args = Array(CommandLine.arguments.dropFirst())
         if args.contains("--help") || args.contains("-h") {
-            print("Usage: coding-agent-proxy [--config config.yaml] [--log-file path] [--check]\nBinds 127.0.0.1 only. --check validates YAML, credentials, account mapping and duplicate credentials without network requests.")
+            print("Usage: coding-agent-proxy [--config config.yaml] [--log-file path] [--check] [--write-config path]\nBinds 127.0.0.1 only. --check validates YAML, credentials, account mapping and duplicate credentials without network requests.")
             return
         }
         var check = false
         var printListenPort = false
         var path = "config.yaml"
         var logPath: String?
+        var writeConfigPath: String?
         while !args.isEmpty {
             let argument = args.removeFirst()
             switch argument {
             case "--check": check = true
             case "--print-listen-port": printListenPort = true
-            case "--config", "--log-file":
+            case "--config", "--log-file", "--write-config":
                 guard !args.isEmpty, !args[0].hasPrefix("--") else {
                     FileHandle.standardError.write(Data("Missing option value. Use --help.\n".utf8)); exit(2)
                 }
                 let value = args.removeFirst()
-                if argument == "--config" { path = value } else { logPath = value }
+                if argument == "--config" { path = value }
+                else if argument == "--write-config" { writeConfigPath = value }
+                else { logPath = value }
             default:
                 FileHandle.standardError.write(Data("Invalid arguments. Use --help.\n".utf8)); exit(2)
             }
@@ -36,6 +39,15 @@ struct CodingAgentProxy {
         path = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath).standardizedFileURL.path
         do {
             let config = try Configuration.read(path)
+            if let destination = writeConfigPath {
+                let text = try config.canonicalYAML()
+                _ = try Configuration.parse(text)
+                let url = URL(fileURLWithPath: NSString(string: destination).expandingTildeInPath)
+                try Data(text.utf8).write(to: url, options: [.atomic])
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                print("Wrote configuration using base_url and routing sections.")
+                return
+            }
             if printListenPort {
                 print(config.listen_port)
                 return

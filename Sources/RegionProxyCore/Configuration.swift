@@ -11,31 +11,58 @@ public struct ProxyError: Error, LocalizedError, Sendable {
 public struct Configuration: Decodable, Sendable {
     public let listen_port: UInt16
     public let auth_file: String
-    public let upstream_base_url: String
+    public let account_upstream_base_url: String
     public let api_key_upstream_base_url: String
     public let request_timeout_seconds: Double
     public let proxies: [String: String]
     public let accounts: [String: String]
     public let providers: [APIKeyProvider]
+    public let account_fallback_proxy: String?
     public let openai_fallback_proxy: String?
     public let mcp_fallback_proxy: String?
 
     enum CodingKeys: String, CodingKey {
-        case listen_port, auth_file, upstream_base_url, request_timeout_seconds, proxies, accounts, api_key_providers, openai_fallback_proxy, api_key_upstream_base_url, mcp_fallback_proxy
+        case base_url, routing, listen_port, auth_file, account_upstream_base_url, upstream_base_url, request_timeout_seconds, proxies, accounts, api_key_providers, openai_fallback_proxy, api_key_upstream_base_url, mcp_fallback_proxy
+    }
+
+    private struct BaseURLs: Codable {
+        let account: String?
+        let api_key: String?
+    }
+
+    private struct Routing: Codable {
+        let account: [String: String]?
+        let api_key: [APIKeyProvider]?
+        let account_fallback: String?
+        let api_key_fallback: String?
+        let mcp_fallback: String?
     }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        let urls = try values.decodeIfPresent(BaseURLs.self, forKey: .base_url)
+        let routing = try values.decodeIfPresent(Routing.self, forKey: .routing)
+        if values.contains(.base_url), [.account_upstream_base_url, .upstream_base_url, .api_key_upstream_base_url].contains(where: values.contains) {
+            throw ProxyError("Do not mix base_url with legacy upstream fields.")
+        }
+        if values.contains(.routing), [.accounts, .api_key_providers, .openai_fallback_proxy, .mcp_fallback_proxy].contains(where: values.contains) {
+            throw ProxyError("Do not mix routing with legacy route fields.")
+        }
         listen_port = try values.decode(UInt16.self, forKey: .listen_port)
         auth_file = try values.decodeIfPresent(String.self, forKey: .auth_file) ?? ""
-        upstream_base_url = try values.decodeIfPresent(String.self, forKey: .upstream_base_url) ?? "https://chatgpt.com/backend-api/codex"
-        api_key_upstream_base_url = try values.decodeIfPresent(String.self, forKey: .api_key_upstream_base_url) ?? "https://api.openai.com/v1"
+        guard !(values.contains(.account_upstream_base_url) && values.contains(.upstream_base_url)) else {
+            throw ProxyError("Use account_upstream_base_url only; do not also set legacy upstream_base_url.")
+        }
+        account_upstream_base_url = try urls?.account ?? values.decodeIfPresent(String.self, forKey: .account_upstream_base_url)
+            ?? values.decodeIfPresent(String.self, forKey: .upstream_base_url) ?? "https://chatgpt.com/backend-api"
+        api_key_upstream_base_url = try urls?.api_key ?? values.decodeIfPresent(String.self, forKey: .api_key_upstream_base_url) ?? "https://api.openai.com/v1"
         request_timeout_seconds = try values.decode(Double.self, forKey: .request_timeout_seconds)
         proxies = try values.decodeIfPresent([String: String].self, forKey: .proxies) ?? [:]
-        accounts = try values.decodeIfPresent([String: String].self, forKey: .accounts) ?? [:]
-        providers = try values.decodeIfPresent([APIKeyProvider].self, forKey: .api_key_providers) ?? []
-        openai_fallback_proxy = try values.decodeIfPresent(String.self, forKey: .openai_fallback_proxy)
-        mcp_fallback_proxy = try values.decodeIfPresent(String.self, forKey: .mcp_fallback_proxy)
+        accounts = try routing?.account ?? values.decodeIfPresent([String: String].self, forKey: .accounts) ?? [:]
+        providers = try routing?.api_key ?? values.decodeIfPresent([APIKeyProvider].self, forKey: .api_key_providers) ?? []
+        account_fallback_proxy = routing?.account_fallback
+        openai_fallback_proxy = try routing?.api_key_fallback ?? values.decodeIfPresent(String.self, forKey: .openai_fallback_proxy)
+        mcp_fallback_proxy = try routing?.mcp_fallback ?? values.decodeIfPresent(String.self, forKey: .mcp_fallback_proxy)
     }
 
     public static func read(_ path: String) throws -> Configuration {
@@ -45,16 +72,44 @@ public struct Configuration: Decodable, Sendable {
         return try parse(text)
     }
 
+    public func canonicalYAML() throws -> String {
+        struct Output: Encodable {
+            let listen_port: UInt16
+            let auth_file: String?
+            let request_timeout_seconds: Double
+            let base_url: BaseURLs
+            let proxies: [String: String]
+            let routing: Routing
+        }
+        let accountBase = account_upstream_base_url.hasSuffix("/backend-api/codex")
+            ? String(account_upstream_base_url.dropLast("/codex".count)) : account_upstream_base_url
+        return try YAMLEncoder().encode(Output(listen_port: listen_port, auth_file: auth_file.isEmpty ? nil : auth_file,
+            request_timeout_seconds: request_timeout_seconds,
+            base_url: BaseURLs(account: accountBase, api_key: api_key_upstream_base_url), proxies: proxies,
+            routing: Routing(account: accounts.isEmpty ? nil : accounts, api_key: providers.isEmpty ? nil : providers,
+                             account_fallback: account_fallback_proxy, api_key_fallback: openai_fallback_proxy,
+                             mcp_fallback: mcp_fallback_proxy)))
+    }
+
     public static func parse(_ text: String) throws -> Configuration {
         let result: Configuration
         do {
-            let allowed: Set<String> = ["listen_port", "auth_file", "upstream_base_url", "request_timeout_seconds", "proxies", "accounts", "api_key_providers", "openai_fallback_proxy", "api_key_upstream_base_url", "mcp_fallback_proxy"]
+            let allowed: Set<String> = ["base_url", "routing", "listen_port", "auth_file", "account_upstream_base_url", "upstream_base_url", "request_timeout_seconds", "proxies", "accounts", "api_key_providers", "openai_fallback_proxy", "api_key_upstream_base_url", "mcp_fallback_proxy"]
             guard let root = try compose(yaml: text)?.mapping,
                   root.keys.allSatisfy({ $0.string.map { allowed.contains($0) } == true }) else {
                 throw ProxyError("Unknown configuration field.")
             }
             result = try YAMLDecoder().decode(Configuration.self, from: text)
-            let nodes = root["api_key_providers"]?.sequence.map { Array($0) } ?? []
+            for (node, keys) in [(root["base_url"], Set(["account", "api_key"])),
+                                 (root["routing"], Set(["account", "api_key", "account_fallback", "api_key_fallback", "mcp_fallback"]))] {
+                if let node {
+                    guard let mapping = node.mapping,
+                          mapping.keys.allSatisfy({ $0.string.map { keys.contains($0) } == true }) else {
+                        throw ProxyError("Unknown nested configuration field.")
+                    }
+                }
+            }
+            let nodes = (root["routing"]?.mapping?["api_key"] ?? root["api_key_providers"])?.sequence.map { Array($0) } ?? []
             for provider in nodes {
                 let providerFields: Set<String> = ["name", "proxy", "upstream_base_url", "api_key_env", "api_key_file"]
                 guard let mapping = provider.mapping,
@@ -67,10 +122,10 @@ public struct Configuration: Decodable, Sendable {
         guard result.listen_port > 0,
               result.request_timeout_seconds.isFinite,
               (1...3600).contains(result.request_timeout_seconds) else { throw ProxyError("Invalid port or timeout (1–3600 seconds).") }
-        try validateUpstream(result.upstream_base_url)
+        try validateUpstream(result.account_upstream_base_url)
         try validateUpstream(result.api_key_upstream_base_url)
-        guard result.auth_file.isEmpty == result.accounts.isEmpty else {
-            throw ProxyError("ChatGPT routing requires both auth_file and account mappings.")
+        guard result.auth_file.isEmpty == (result.accounts.isEmpty && result.account_fallback_proxy == nil) else {
+            throw ProxyError("ChatGPT routing requires auth_file and account mappings or account_fallback.")
         }
         for (name, value) in result.proxies {
             guard !name.isEmpty, name != "none" else { throw ProxyError("Proxy names must be nonempty; none is reserved for direct connections.") }
@@ -81,14 +136,12 @@ public struct Configuration: Decodable, Sendable {
                 throw ProxyError("Every account must select an existing proxy name or none.")
             }
         }
-        if let fallback = result.openai_fallback_proxy {
-            guard !fallback.isEmpty, (fallback == "none" || result.proxies[fallback] != nil) else {
-                throw ProxyError("openai_fallback_proxy must select an existing proxy or none.")
-            }
-        }
-        if let fallback = result.mcp_fallback_proxy {
-            guard !fallback.isEmpty, (fallback == "none" || result.proxies[fallback] != nil) else {
-                throw ProxyError("mcp_fallback_proxy must select an existing proxy or none.")
+        for (name, value) in [("account_fallback", result.account_fallback_proxy),
+                              ("api_key_fallback", result.openai_fallback_proxy), ("mcp_fallback", result.mcp_fallback_proxy)] {
+            if let fallback = value {
+                guard !fallback.isEmpty, fallback == "none" || result.proxies[fallback] != nil else {
+                    throw ProxyError("routing.\(name) must select an existing proxy or none.")
+                }
             }
         }
         for provider in result.providers {
@@ -222,7 +275,7 @@ public struct Configuration: Decodable, Sendable {
         }
         if let identity = matchedIdentity {
             return CredentialRoute(token: identity.accessToken, accountID: identity.accountID, provider: nil,
-                proxy: try proxyName(for: identity), upstream: upstream_base_url)
+                proxy: try proxyName(for: identity), upstream: account_upstream_base_url)
         }
         if let route = matches.first { return route }
         if allowOpenAIFallback, let proxy = openai_fallback_proxy {
@@ -268,14 +321,14 @@ public struct Configuration: Decodable, Sendable {
     }
 
     public func proxyName(for identity: Identity) throws -> String {
-        guard let name = accounts[identity.accountID] else {
+        guard let name = accounts[identity.accountID] ?? account_fallback_proxy else {
             throw ProxyError("Current account has no proxy mapping; forwarding refused.")
         }
         return name
     }
 }
 
-public struct APIKeyProvider: Decodable, Sendable {
+public struct APIKeyProvider: Codable, Sendable {
     public let upstream_base_url: String?
     public var name: String { providerID ?? api_key_env ?? "" }
     public let proxy: String
@@ -285,6 +338,15 @@ public struct APIKeyProvider: Decodable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case name, proxy, upstream_base_url, api_key_env, api_key_file
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encodeIfPresent(providerID, forKey: .name)
+        try values.encode(proxy, forKey: .proxy)
+        try values.encodeIfPresent(upstream_base_url, forKey: .upstream_base_url)
+        try values.encodeIfPresent(api_key_env, forKey: .api_key_env)
+        try values.encodeIfPresent(api_key_file, forKey: .api_key_file)
     }
 
     public init(from decoder: Decoder) throws {

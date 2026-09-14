@@ -292,6 +292,38 @@ api_key_providers:
             assert len(a.requests) + len(b.requests) > total, "Running process retains valid startup configuration"
             invalid = subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             assert invalid.returncode != 0
+            login("fallback-account", "fallback-account-token")
+            config.write_text(f'''listen_port: {port}
+request_timeout_seconds: 3
+auth_file: "{auth}"
+base_url:
+  account: https://chatgpt-mixed.invalid/backend-api
+  api_key: https://fallback-default.invalid/v1
+proxies:
+  us: http://127.0.0.1:{a.server_address[1]}
+  jp: http://127.0.0.1:{b.server_address[1]}
+routing:
+  account_fallback: us
+  api_key_fallback: jp
+  mcp_fallback: us
+''')
+            migrated = temp / "migrated.yaml"
+            subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config), "--write-config", str(migrated)], check=True)
+            assert migrated.stat().st_mode & 0o777 == 0o600
+            assert "base_url:" in migrated.read_text() and "routing:" in migrated.read_text()
+            migrated.replace(config)
+            restart()
+            for credential, path, probe, host in [
+                ("fallback-account-token", "/v1/responses", a, "chatgpt-mixed.invalid"),
+                ("fallback-account-token", "/backend-api/ps/plugins/installed", a, "chatgpt-mixed.invalid"),
+                ("unknown-api-token", "/v1/responses", b, "fallback-default.invalid"),
+                (None, "/mcp/openaiDeveloperDocs", a, "developers.openai.com")
+            ]:
+                before = len(probe.requests)
+                assert request(token=credential, path=path)[0] == 502
+                assert len(probe.requests) > before
+                assert probe.requests[-1].startswith(f"CONNECT {host}:443 ".encode())
+            print("PASS: nested base_url/routing schema, independent account/API/MCP fallbacks and private migration")
             print("PASS: unmatched credentials use only configured OpenAI fallback proxy; ambiguity and invalid proxy refused")
             print("PASS: API Key mode, no auth.json dependency, designated CONNECT route, key rotation, missing-key refusal")
             print("PASS: startup route, per-request accounts/proxies, failures, request IDs, durations, credential/body/query exclusion")

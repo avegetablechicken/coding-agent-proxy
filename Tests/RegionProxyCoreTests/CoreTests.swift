@@ -23,6 +23,15 @@ final class CoreTests: XCTestCase {
         XCTAssertThrowsError(try config.proxyName(for: Identity(accountID: "unknown", accessToken: "a")))
     }
 
+    func testAccountUpstreamNameAndDefault() throws {
+        let minimal = "listen_port: 7889\nrequest_timeout_seconds: 30"
+        XCTAssertEqual(try Configuration.parse(minimal).account_upstream_base_url, "https://chatgpt.com/backend-api")
+        XCTAssertEqual(try Configuration.parse(minimal + "\naccount_upstream_base_url: https://account.example.com/backend-api").account_upstream_base_url,
+                       "https://account.example.com/backend-api")
+        XCTAssertEqual(try Configuration.parse(yaml).account_upstream_base_url, "https://chatgpt.com/backend-api/codex")
+        XCTAssertThrowsError(try Configuration.parse(yaml + "\naccount_upstream_base_url: https://chatgpt.com/backend-api"))
+    }
+
     func testMCPFallbackIsIndependentOfOpenAIFallback() throws {
         let config = try Configuration.parse(yaml + "\nopenai_fallback_proxy: us\nmcp_fallback_proxy: jp")
         let identity = { Identity(accountID: "account-a", accessToken: "known") }
@@ -133,6 +142,14 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(try Configuration.proxyConfiguration("socks5://localhost:8080").allowFailover)
     }
 
+    func testAuthSnapshotValidation() throws {
+        let identity = try Identity.parse(Data(#"{"tokens":{"account_id":"abc","access_token":"secret"}}"#.utf8))
+        XCTAssertEqual(identity.accountID, "abc")
+        for value in ["{}", #"{"OPENAI_API_KEY":"secret"}"#, #"{"tokens":{"account_id":"","access_token":"secret"}}"#, #"{"tokens":{"account_id":"abc","access_token":"bad\r\nheader"}}"#] {
+            XCTAssertThrowsError(try Identity.parse(Data(value.utf8)))
+        }
+    }
+
     func testProxyCredentialsAndRedaction() throws {
         for scheme in ["http", "https", "socks5"] {
             let endpoint = "\(scheme)://user%40example:p%3Ass%40word@localhost:8080"
@@ -149,15 +166,6 @@ final class CoreTests: XCTestCase {
         }
     }
 
-
-    func testAuthSnapshotValidation() throws {
-        let identity = try Identity.parse(Data(#"{"tokens":{"account_id":"abc","access_token":"secret"}}"#.utf8))
-        XCTAssertEqual(identity.accountID, "abc")
-        for value in ["{}", #"{"OPENAI_API_KEY":"secret"}"#, #"{"tokens":{"account_id":"","access_token":"secret"}}"#, #"{"tokens":{"account_id":"abc","access_token":"bad\r\nheader"}}"#] {
-            XCTAssertThrowsError(try Identity.parse(Data(value.utf8)))
-        }
-    }
-
     func testURLMappingPreservesQueryAndRejectsEscapes() throws {
         let base = "https://chatgpt.com/backend-api/codex"
         for path in ["/responses?x=a%2Fb", "/v1/responses?x=a%2Fb", "/backend-api/codex/responses?x=a%2Fb"] {
@@ -166,6 +174,11 @@ final class CoreTests: XCTestCase {
         for path in ["//evil.test/a", "https://evil.test", "/%2e%2e/secret", "/responses#fragment"] {
             XCTAssertThrowsError(try Forwarder.upstreamURL(base: base, target: path))
         }
+    }
+
+    func testHeaderFiltering() {
+        let result = Forwarder.forwardHeaders(["connection": "x-private, keep-alive", "x-private": "hidden", "authorization": "secret", "host": "localhost", "content-length": "5", "x-request-id": "abc", "content-type": "application/json"])
+        XCTAssertEqual(result, ["x-request-id": "abc", "content-type": "application/json"])
     }
 
     func testChatGPTBackendPathsKeepOfficialPrefix() throws {
@@ -180,7 +193,6 @@ final class CoreTests: XCTestCase {
         }
     }
 
-
     func testSharedAccountBackendRootRoutesAllNamespaces() throws {
         let base = "https://chatgpt.com/backend-api"
         for (target, path) in [("/v1/responses", "/codex/responses"), ("/models", "/codex/models"),
@@ -193,12 +205,6 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(try Forwarder.accountQueryURL(base: base, target: "/backend-api/wham/usage").absoluteString, base + "/wham/usage")
         XCTAssertEqual(try Forwarder.upstreamURL(base: base, target: "/https://chatgpt.com/backend-api/ps/plugins/installed", chatGPTBackend: true).absoluteString,
                        base + "/ps/plugins/installed")
-    }
-
-
-    func testHeaderFiltering() {
-        let result = Forwarder.forwardHeaders(["connection": "x-private, keep-alive", "x-private": "hidden", "authorization": "secret", "host": "localhost", "content-length": "5", "x-request-id": "abc", "content-type": "application/json"])
-        XCTAssertEqual(result, ["x-request-id": "abc", "content-type": "application/json"])
     }
 
     func testExplicitUpstreamPathPreservesEndpointAndQuery() throws {

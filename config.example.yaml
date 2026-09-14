@@ -1,46 +1,42 @@
-# Copy to config.yaml. Account IDs are tokens.account_id in ~/.codex/auth.json.
+# Copy to config.yaml. YAML is loaded once; restart after changing it.
 listen_port: 8787
 auth_file: "~/.codex/auth.json"
-upstream_base_url: "https://chatgpt.com/backend-api/codex"
-api_key_upstream_base_url: "https://api.openai.com/v1"
 request_timeout_seconds: 300
 
-# Explicit ports required; http CONNECT, https CONNECT and socks5 supported.
-# Optional authentication: scheme://username:password@host:port.
-# Percent-encode reserved characters in credentials.
-# Set any route's proxy to none for explicit direct access; aliases can also map to none.
+base_url:
+  account: "https://chatgpt.com/backend-api"
+  api_key: "https://api.openai.com/v1"
+
+# HTTP CONNECT, HTTPS CONNECT or SOCKS5; an explicit port is required.
+# Optional username/password: http://user:password@host:port
+# Percent-encode reserved credential characters, e.g. @ -> %40.
 proxies:
   us: "http://127.0.0.1:8101"
   jp: "socks5://127.0.0.1:8102"
+  # authenticated: "http://proxy-user:proxy-password@proxy.example.com:8080"
 
-# Optional: unmatched Bearer tokens go to api_key_upstream_base_url through this proxy.
-# Without this setting, unmatched credentials are refused.
-# openai_fallback_proxy: us  # Or none for explicit direct access.
+routing:
+  account:
+    "replace-with-us-account-id": us
+    "replace-with-jp-account-id": jp
 
-# Public docs MCP: use this proxy when no credential route can be selected.
-# Omitted (or none) means direct access. Independent of openai_fallback_proxy.
-# mcp_fallback_proxy: jp
+  # Optional: uses env_key from the named Codex provider (openai -> OPENAI_API_KEY).
+  # Each entry may use api_key_env OR api_key_file. Keys must be distinct.
+  # api_key:
+  #   - name: openai
+  #     proxy: us
+  #   - name: openai
+  #     api_key_env: SECOND_OPENAI_API_KEY
+  #     proxy: jp
+  #   - name: provider-a
+  #     api_key_file: "~/.config/coding-agent-proxy/provider-a.key"
+  #     upstream_base_url: "https://a.example.com/v1"
+  #     proxy: us
 
-accounts:
-  "replace-with-us-account-id": us
-  "replace-with-jp-account-id": jp
-
-# Optional API Key routes share this listener with auth.json account routing.
-# Bearer tokens must be distinct across the account and all providers.
-# api_key_providers:
-#   - name: openai
-#     # Uses Codex base_url, then top-level api_key_upstream_base_url.
-#     proxy: us  # Default outbound proxy for the official OpenAI API.
-#     # name resolves the Codex provider's env_key (openai -> OPENAI_API_KEY).
-#     # Optional api_key_env overrides the key source, not the provider URL.
-#   - name: openai
-#     api_key_env: SECOND_OPENAI_API_KEY
-#     proxy: jp  # Same provider, another key and proxy.
-#   - name: provider-a
-#     upstream_base_url: "https://a.example.com/v1"
-#     proxy: us
-#     api_key_file: "~/.config/coding-agent-proxy/provider-a.key"
-#   - api_key_env: PROVIDER_B_API_KEY
-#     # Resolve base_url from the Codex provider with this env_key.
-#     # Optional override: upstream_base_url: "https://b.example.com/v1"
-#     proxy: jp
+  # All fallback fields reference proxies above, or none for explicit direct access.
+  # Account: only a verified ChatGPT token without an account mapping can use it.
+  # account_fallback: jp
+  # API Key: unmatched Bearer tokens go to base_url.api_key; missing auth is refused.
+  # api_key_fallback: us
+  # Public MCP: no matching credential route; omitted/null/none means direct.
+  # mcp_fallback: jp
