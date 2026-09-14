@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Offline integration: real listener, URLSession CONNECT, startup configuration, fail-closed routing.
-Uses only synthetic credentials and loopback sockets. Run after swift build.
+"""Offline integration: real listener, HTTP CONNECT, startup configuration, fail-closed routing.
+Uses only synthetic credentials and loopback sockets. Run after cargo build; CODING_AGENT_PROXY_BINARY can select another executable.
 """
 import http.client
 import json
@@ -14,6 +14,7 @@ import threading
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+BINARY = os.environ.get("CODING_AGENT_PROXY_BINARY", str(ROOT / "target/debug" / ("coding-agent-proxy.exe" if os.name == "nt" else "coding-agent-proxy")))
 
 class Probe(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
@@ -49,7 +50,7 @@ def main():
                 staged.replace(auth)
             def configure(a_proxy):
                 value = f'''listen_port: {port}
-auth_file: "{auth}"
+auth_file: "{auth.as_posix()}"
 upstream_base_url: "https://upstream.invalid/backend-api/codex"
 request_timeout_seconds: 3
 proxies:
@@ -76,7 +77,7 @@ accounts:
                 return result
             login("account-a", "token-a")
             configure(a.server_address[1])
-            subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config), "--check"], check=True)
+            subprocess.run([BINARY, "--config", str(config), "--check"], check=True)
             codex_home = temp / "codex"
             codex_home.mkdir()
             (codex_home / "config.toml").write_text('[model_providers.reverse]\nenv_key = "REVERSE_TEST_KEY"\nbase_url = "https://provider-a.invalid/v1"\n')
@@ -86,7 +87,7 @@ accounts:
                 if process is not None:
                     process.terminate()
                     process.communicate(timeout=5)
-                process = subprocess.Popen([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=test_environment)
+                process = subprocess.Popen([BINARY, "--config", str(config)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=test_environment)
                 for _ in range(100):
                     try:
                         assert request(path="/health")[0] == 200
@@ -132,7 +133,7 @@ accounts:
             config.write_text("invalid: [")
             assert request()[0] == 502
             assert len(a.requests) + len(b.requests) == before_failure
-            invalid = subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            invalid = subprocess.run([BINARY, "--config", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             assert invalid.returncode != 0, "Invalid YAML must fail at startup"
             config.unlink()
             assert request()[0] == 502
@@ -168,11 +169,11 @@ api_key_providers:
 - name: api-provider
   upstream_base_url: "https://api-provider.invalid/v1"
   proxy: chosen
-  api_key_file: "{key_file}"
+  api_key_file: "{key_file.as_posix()}"
 ''')
             restart()
             auth.unlink()  # API Key mode must not depend on ChatGPT credentials.
-            subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config), "--check"], check=True)
+            subprocess.run([BINARY, "--config", str(config), "--check"], check=True)
             previous_a, previous_b = len(a.requests), len(b.requests)
             assert request(token="wrong")[0] == 401
             assert len(a.requests) == previous_a and len(b.requests) == previous_b
@@ -194,7 +195,7 @@ api_key_providers:
             key_b = temp / "provider-b.key"
             key_b.write_text("provider-key-two")
             config.write_text(f'''listen_port: {port}
-auth_file: "{auth}"
+auth_file: "{auth.as_posix()}"
 upstream_base_url: "https://chatgpt-mixed.invalid/backend-api/codex"
 request_timeout_seconds: 3
 proxies:
@@ -208,7 +209,7 @@ api_key_providers:
   - name: provider-b
     upstream_base_url: "https://provider-b.invalid/v1"
     proxy: jp
-    api_key_file: "{key_b}"
+    api_key_file: "{key_b.as_posix()}"
   - name: reverse
     api_key_env: EXTRA_KEY_A
     proxy: us
@@ -290,12 +291,12 @@ api_key_providers:
             config.write_text(config.read_text().replace("openai_fallback_proxy: jp", "openai_fallback_proxy: missing"))
             assert request(token="unmatched-openai-key")[0] == 502
             assert len(a.requests) + len(b.requests) > total, "Running process retains valid startup configuration"
-            invalid = subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            invalid = subprocess.run([BINARY, "--config", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             assert invalid.returncode != 0
             login("fallback-account", "fallback-account-token")
             config.write_text(f'''listen_port: {port}
 request_timeout_seconds: 3
-auth_file: "{auth}"
+auth_file: "{auth.as_posix()}"
 base_url:
   account: https://chatgpt-mixed.invalid/backend-api
   api_key: https://fallback-default.invalid/v1
@@ -311,8 +312,8 @@ routing:
   mcp_fallback: us
 ''')
             migrated = temp / "migrated.yaml"
-            subprocess.run([str(ROOT / ".build/debug/coding-agent-proxy"), "--config", str(config), "--write-config", str(migrated)], check=True)
-            assert migrated.stat().st_mode & 0o777 == 0o600
+            subprocess.run([BINARY, "--config", str(config), "--write-config", str(migrated)], check=True)
+            assert os.name == "nt" or migrated.stat().st_mode & 0o777 == 0o600
             assert "base_url:" in migrated.read_text() and "routing:" in migrated.read_text()
             migrated.replace(config)
             restart()

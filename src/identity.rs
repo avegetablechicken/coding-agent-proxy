@@ -1,0 +1,392 @@
+use crate::{
+    Error, Result,
+    config::{Config, Provider, expand, unwrap_upstream},
+};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::Deserialize;
+use serde_json::Value;
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
+
+#[derive(Clone)]
+pub struct Identity {
+    pub account_id: String,
+    pub token: String,
+    pub usernames: Vec<String>,
+}
+pub fn valid_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b > 32 && b < 127)
+}
+fn claims(token: &str) -> Value {
+    let parts: Vec<_> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Value::Null;
+    }
+    URL_SAFE_NO_PAD
+        .decode(parts[1].trim_end_matches('='))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null)
+}
+fn usernames(access: &Value, id: &Value) -> Vec<String> {
+    ["email", "preferred_username", "name"]
+        .into_iter()
+        .filter_map(|key| {
+            access["https://api.openai.com/profile"][key]
+                .as_str()
+                .or(access[key].as_str())
+                .or(id[key].as_str())
+                .filter(|s| !s.trim().is_empty() && !s.chars().any(char::is_control))
+                .map(String::from)
+        })
+        .collect()
+}
+impl Identity {
+    pub fn read(path: &str) -> Result<Self> {
+        let raw =
+            std::fs::read(expand(path)).map_err(|_| Error::config("Cannot read auth_file."))?;
+        let value: Value =
+            serde_json::from_slice(&raw).map_err(|_| Error::config("Invalid auth_file."))?;
+        let tokens = &value["tokens"];
+        let id = tokens["account_id"]
+            .as_str()
+            .filter(|s| valid_token(s))
+            .ok_or(Error::config("auth_file requires tokens.account_id."))?;
+        let token = tokens["access_token"]
+            .as_str()
+            .filter(|s| valid_token(s))
+            .ok_or(Error::config("auth_file requires tokens.access_token."))?;
+        Ok(Self {
+            account_id: id.into(),
+            token: token.into(),
+            usernames: usernames(
+                &claims(token),
+                &claims(tokens["id_token"].as_str().unwrap_or("")),
+            ),
+        })
+    }
+    pub fn from_token(token: &str) -> Option<Self> {
+        let c = claims(token);
+        let id = c["https://api.openai.com/auth"]["chatgpt_account_id"]
+            .as_str()
+            .filter(|s| valid_token(s))?;
+        Some(Self {
+            account_id: id.into(),
+            token: token.into(),
+            usernames: usernames(&c, &Value::Null),
+        })
+    }
+}
+#[derive(Deserialize)]
+struct Definition {
+    env_key: Option<String>,
+    base_url: Option<String>,
+    #[serde(default)]
+    requires_openai_auth: bool,
+}
+fn definitions() -> Result<BTreeMap<String, Definition>> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| expand("~/.codex"));
+    let path = home.join("config.toml");
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        model_providers: BTreeMap<String, Definition>,
+    }
+    let mut defs = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            toml::from_str::<File>(&text)
+                .map_err(|_| Error::config("Cannot parse Codex config.toml."))?
+                .model_providers
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(_) => return Err(Error::config("Cannot read Codex config.toml.")),
+    };
+    if defs.contains_key("openai") {
+        return Err(Error::config("Reserved Codex provider ID openai."));
+    }
+    defs.retain(|_, v| !v.requires_openai_auth);
+    if defs
+        .values()
+        .any(|d| d.env_key.as_ref().is_some_and(|k| k.trim().is_empty()))
+    {
+        return Err(Error::config("Invalid Codex provider env_key."));
+    }
+    defs.insert(
+        "openai".into(),
+        Definition {
+            env_key: Some("OPENAI_API_KEY".into()),
+            base_url: None,
+            requires_openai_auth: false,
+        },
+    );
+    Ok(defs)
+}
+impl Provider {
+    pub async fn credential(&self, default: &str, shell: bool) -> Result<(String, String)> {
+        if let Some(path) = &self.api_key_file {
+            let raw = std::fs::read_to_string(expand(path))
+                .map_err(|_| Error::config("Cannot read API Key file."))?;
+            let upstream = unwrap_upstream(self.upstream_base_url.as_deref().unwrap_or(default))?;
+            return Ok((key(&raw)?, upstream));
+        }
+        let defs = definitions()?;
+        let selected_id = self
+            .name
+            .as_deref()
+            .or(self.selector.as_deref().filter(|s| defs.contains_key(*s)));
+        let selected_env = self.api_key_env.as_deref().or(if selected_id.is_none() {
+            self.selector.as_deref()
+        } else {
+            None
+        });
+        let named = if let Some(id) = selected_id {
+            Some((
+                id,
+                defs.get(id).ok_or(Error::config(
+                    "Codex Provider ID has no API Key configuration.",
+                ))?,
+            ))
+        } else {
+            None
+        };
+        let reversed = if named.is_none() {
+            if let Some(var) = selected_env {
+                let candidates: Vec<_> = defs
+                    .iter()
+                    .filter(|(_, d)| d.env_key.as_deref() == Some(var))
+                    .collect();
+                if candidates.len() > 1 {
+                    return Err(Error::config(
+                        "API Key environment variable matches multiple Codex providers.",
+                    ));
+                }
+                candidates.first().map(|(id, d)| (id.as_str(), *d))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let definition = named.or(reversed);
+        let var = selected_env
+            .or(definition.and_then(|(_, d)| d.env_key.as_deref()))
+            .ok_or(Error::config(
+                "API Key environment variable is unavailable.",
+            ))?;
+        let raw = match std::env::var(var) {
+            Ok(v) => v,
+            Err(_) if shell => shell_value(var).await?,
+            Err(_) => {
+                return Err(Error::config(
+                    "API Key environment variable is unavailable.",
+                ));
+            }
+        };
+        let upstream = self
+            .upstream_base_url
+            .as_deref()
+            .or(definition
+                .filter(|(id, _)| *id != "openai")
+                .and_then(|(_, d)| d.base_url.as_deref()))
+            .unwrap_or(default);
+        Ok((key(&raw)?, unwrap_upstream(upstream)?))
+    }
+}
+fn key(raw: &str) -> Result<String> {
+    let k = raw.trim();
+    if !valid_token(k) {
+        return Err(Error::config(
+            "API Key must be a nonempty ASCII token without whitespace or control characters.",
+        ));
+    }
+    Ok(k.into())
+}
+#[cfg(unix)]
+async fn shell_value(name: &str) -> Result<String> {
+    use std::{os::unix::process::CommandExt, process::Stdio};
+    let bad =
+        || Error::config("API Key environment variable is unavailable or shell lookup timed out.");
+    if name.is_empty()
+        || !name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || i > 0 && b.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let shell_path = std::path::Path::new(&shell);
+    if !shell_path.is_absolute()
+        || !matches!(
+            shell_path.file_name().and_then(|s| s.to_str()),
+            Some("zsh" | "bash" | "sh")
+        )
+    {
+        return Err(bad());
+    }
+    let dir = tempfile::tempdir().map_err(|_| bad())?;
+    let output = dir.path().join("value");
+    let mut cmd = std::process::Command::new(shell);
+    cmd.args([
+        "-l",
+        "-i",
+        "-c",
+        "umask 077; exec /usr/bin/printenv \"$1\" > \"$2\"",
+        "coding-agent-proxy",
+        name,
+    ])
+    .arg(&output)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .process_group(0);
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|_| bad())?;
+    // Kill the process group even on cancellation, including shell startup descendants.
+    struct Group(u32);
+    impl Drop for Group {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.0 as i32), libc::SIGKILL);
+            }
+        }
+    }
+    let group = Group(child.id().ok_or_else(bad)?);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+    drop(group);
+    if !matches!(status, Ok(Ok(s)) if s.success()) {
+        let _ = child.wait().await;
+        return Err(bad());
+    }
+    if std::fs::metadata(&output).map_err(|_| bad())?.len() > 65536 {
+        return Err(bad());
+    }
+    std::fs::read_to_string(output).map_err(|_| bad())
+}
+#[cfg(not(unix))]
+async fn shell_value(_: &str) -> Result<String> {
+    Err(Error::config(
+        "API Key must be exported into the service process environment on Windows.",
+    ))
+}
+
+impl Config {
+    pub fn account_choice(&self, identity: &Identity) -> Result<crate::config::Choice> {
+        self.routing
+            .account
+            .get(&identity.account_id)
+            .or_else(|| {
+                identity
+                    .usernames
+                    .iter()
+                    .find_map(|u| self.routing.account.get(u))
+            })
+            .or(self.routing.account_fallback.as_ref())
+            .cloned()
+            .ok_or(Error::config(
+                "Current account has no proxy mapping; forwarding refused.",
+            ))
+    }
+    pub async fn check_credentials(&self) -> Result<()> {
+        let mut keys = HashSet::new();
+        if self.account_auth_file_only && !self.auth_file.is_empty() {
+            let i = Identity::read(&self.auth_file)?;
+            self.account_choice(&i)?;
+            keys.insert(i.token);
+        }
+        for p in &self.providers {
+            if !keys.insert(p.credential(&self.base_url.api_key, true).await?.0) {
+                return Err(Error::config("Multiple routes have the same credential."));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    fn jwt(value: Value) -> String {
+        format!(
+            "e30.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap())
+        )
+    }
+    #[tokio::test]
+    async fn incoming_accounts_preserve_identity_precedence_and_fail_closed() {
+        let token = jwt(
+            json!({"https://api.openai.com/auth":{"chatgpt_account_id":"account-1"},"https://api.openai.com/profile":{"email":"profile@example.com"},"email":"top@example.com"}),
+        );
+        let i = Identity::from_token(&token).unwrap();
+        assert_eq!(i.usernames, vec!["profile@example.com"]);
+        let config=Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\naccount_auth_file_only: false\nrouting:\n  account:\n    account-1: none\n    profile@example.com: other\nproxies:\n  other: http://localhost:8080\n").unwrap();
+        let route = config
+            .resolve(Some(&format!("Bearer {token}")), true)
+            .await
+            .unwrap();
+        assert_eq!(route.proxy.label(), "none");
+        assert!(
+            config
+                .resolve(Some("Bearer arbitrary"), true)
+                .await
+                .is_err()
+        );
+        let no_account = jwt(json!({"email":"profile@example.com"}));
+        assert!(
+            config
+                .resolve(Some(&format!("Bearer {no_account}")), true)
+                .await
+                .is_err()
+        );
+        assert!(
+            config
+                .resolve(Some("Bearer token with spaces"), true)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn saved_identity_rotates_and_duplicate_keys_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        let keyfile = dir.path().join("api.key");
+        let write = |id: &str, token: &str| {
+            std::fs::write(&auth,json!({"tokens":{"account_id":id,"access_token":token,"id_token":jwt(json!({"email":"id@example.com"}))}}).to_string()).unwrap()
+        };
+        write("a", "token-a");
+        std::fs::write(&keyfile, "other-key").unwrap();
+        let quoted = |p: &std::path::Path| serde_json::to_string(&p.to_string_lossy()).unwrap();
+        let c=Config::parse(&format!("listen_port: 7889\nrequest_timeout_seconds: 3\nauth_file: {}\naccounts:\n  a: none\n  b: none\napi_key_providers:\n  - name: test\n    api_key_file: {}\n    proxy: none\n",quoted(&auth),quoted(&keyfile))).unwrap();
+        assert_eq!(
+            Identity::read(auth.to_str().unwrap()).unwrap().usernames,
+            vec!["id@example.com"]
+        );
+        assert!(c.resolve(Some("Bearer token-a"), true).await.is_ok());
+        write("b", "token-b");
+        assert!(c.resolve(Some("Bearer token-a"), true).await.is_err());
+        assert_eq!(
+            c.resolve(Some("Bearer token-b"), true)
+                .await
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some("b")
+        );
+        std::fs::write(&keyfile, "token-b").unwrap();
+        assert_eq!(
+            c.resolve(Some("Bearer token-b"), true)
+                .await
+                .err()
+                .unwrap()
+                .status,
+            409
+        );
+        assert!(c.check_credentials().await.is_err());
+    }
+}

@@ -7,3 +7,4 @@ logs/
 *.log.1
 nohup.out
 __pycache__/
+target/

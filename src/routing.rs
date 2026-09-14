@@ -1,0 +1,235 @@
+use crate::{
+    Error, Result,
+    config::{Choice, Config},
+    identity::{Identity, valid_token},
+};
+use url::Url;
+#[derive(Clone)]
+pub struct Route {
+    pub token: String,
+    pub account_id: Option<String>,
+    pub provider: Option<String>,
+    pub proxy: Choice,
+    pub upstream: String,
+}
+impl Config {
+    pub async fn resolve(&self, authorization: Option<&str>, fallback: bool) -> Result<Route> {
+        let token = authorization
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .filter(|s| valid_token(s))
+            .ok_or(Error::new(401, "A configured Bearer token is required."))?;
+        let mut unavailable = false;
+        let mut identity = None;
+        if !self.auth_file.is_empty() {
+            match Identity::read(&self.auth_file) {
+                Ok(i) if i.token == token => identity = Some(i),
+                Ok(_) => {}
+                Err(_) => unavailable = true,
+            }
+        }
+        if identity.is_none()
+            && !self.account_auth_file_only
+            && (!self.routing.account.is_empty() || self.routing.account_fallback.is_some())
+        {
+            identity = Identity::from_token(token);
+        }
+        let mut matches = Vec::new();
+        for p in &self.providers {
+            match p
+                .credential(&self.base_url.api_key, identity.is_none())
+                .await
+            {
+                Ok((key, upstream)) if key == token => matches.push(Route {
+                    token: key,
+                    account_id: None,
+                    provider: Some(p.label().into()),
+                    proxy: p.proxy.clone(),
+                    upstream,
+                }),
+                Ok(_) => {}
+                Err(_) => unavailable = true,
+            }
+        }
+        if matches.len() + usize::from(identity.is_some()) > 1 {
+            return Err(Error::new(
+                409,
+                "Bearer token matches multiple routes; configure distinct credentials.",
+            ));
+        }
+        if let Some(i) = identity {
+            let proxy = self.account_choice(&i)?;
+            return Ok(Route {
+                token: i.token,
+                account_id: Some(i.account_id),
+                provider: None,
+                proxy,
+                upstream: self.base_url.account.clone(),
+            });
+        }
+        if let Some(r) = matches.pop() {
+            return Ok(r);
+        }
+        if fallback {
+            if let Some(proxy) = &self.routing.api_key_fallback {
+                return Ok(Route {
+                    token: token.into(),
+                    account_id: None,
+                    provider: Some("openai-fallback".into()),
+                    proxy: proxy.clone(),
+                    upstream: self.base_url.api_key.clone(),
+                });
+            }
+        }
+        if unavailable {
+            Err(Error::config(
+                "No matching route; one or more credential sources are unavailable.",
+            ))
+        } else {
+            Err(Error::new(
+                401,
+                "Bearer token does not match a configured credential.",
+            ))
+        }
+    }
+}
+pub const MCP_PATH: &str = "/mcp/openaiDeveloperDocs";
+pub const MCP_UPSTREAM: &str = "https://developers.openai.com/mcp";
+fn valid_target(target: &str) -> Result<()> {
+    let decoded = percent_encoding::percent_decode_str(target)
+        .decode_utf8()
+        .map_err(|_| Error::config("Invalid request target."))?;
+    if !target.starts_with('/')
+        || target.starts_with("//")
+        || target.contains('#')
+        || decoded.contains('\\')
+        || decoded.split('/').any(|s| s == "..")
+    {
+        return Err(Error::config("Invalid request target."));
+    }
+    Ok(())
+}
+pub fn account_query(target: &str) -> bool {
+    let path = if target.starts_with("/https://") || target.starts_with("/http://") {
+        Url::parse(&target[1..])
+            .ok()
+            .map(|u| u.path().to_string())
+            .unwrap_or_default()
+    } else {
+        target.split('?').next().unwrap_or("").to_string()
+    };
+    matches!(
+        path.as_str(),
+        "/backend-api/wham/usage" | "/backend-api/wham/rate-limit-reset-credits"
+    )
+}
+pub fn upstream_url(base: &str, target: &str, account: bool) -> Result<Url> {
+    valid_target(target)?;
+    let mut b = Url::parse(base).map_err(|_| Error::config("Invalid upstream URL."))?;
+    let backend = account
+        && matches!(
+            b.path().trim_matches('/'),
+            "backend-api" | "backend-api/codex"
+        );
+    if backend {
+        b.set_path("/backend-api");
+    }
+    if target.starts_with("/https://") || target.starts_with("/http://") {
+        let dest =
+            Url::parse(&target[1..]).map_err(|_| Error::config("Invalid explicit upstream."))?;
+        let root = b.path().trim_end_matches('/');
+        if dest.scheme() != "https"
+            || !dest.username().is_empty()
+            || dest.password().is_some()
+            || dest.fragment().is_some()
+            || dest.host_str() != b.host_str()
+            || dest.port_or_known_default() != b.port_or_known_default()
+            || !(dest.path() == root || dest.path().starts_with(&format!("{root}/")))
+        {
+            return Err(Error::config(
+                "Explicit upstream must match the credential's configured HTTPS upstream and API base.",
+            ));
+        }
+        return Ok(dest);
+    }
+    let dest = if backend {
+        if target.starts_with("/backend-api/") {
+            b.set_path("");
+            format!("{}{target}", b.as_str().trim_end_matches('/'))
+        } else {
+            let suffix = target
+                .strip_prefix("/v1/")
+                .map(|v| format!("/{v}"))
+                .unwrap_or_else(|| target.into());
+            format!(
+                "{}{}{suffix}",
+                b.as_str().trim_end_matches('/'),
+                if suffix.starts_with("/codex/") {
+                    ""
+                } else {
+                    "/codex"
+                }
+            )
+        }
+    } else {
+        let suffix = ["/backend-api/codex", "/v1"]
+            .into_iter()
+            .find_map(|prefix| {
+                target
+                    .strip_prefix(&format!("{prefix}/"))
+                    .map(|s| format!("/{s}"))
+            })
+            .unwrap_or_else(|| target.into());
+        format!("{}{suffix}", base.trim_end_matches('/'))
+    };
+    Url::parse(&dest).map_err(|_| Error::config("Invalid upstream URL."))
+}
+pub fn query_url(base: &str, target: &str) -> Result<Url> {
+    let b = Url::parse(base).map_err(|_| Error::config("Invalid account query base."))?;
+    if !account_query(target) || !matches!(b.path(), "/backend-api" | "/backend-api/codex") {
+        return Err(Error::config(
+            "Account queries require a ChatGPT /backend-api upstream.",
+        ));
+    }
+    upstream_url(base, target, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn paths_and_origin_boundaries() {
+        let b = "https://chatgpt.com/backend-api/codex";
+        for t in [
+            "/responses",
+            "/v1/responses",
+            "/backend-api/codex/responses",
+        ] {
+            assert_eq!(
+                upstream_url(b, t, true).unwrap().as_str(),
+                "https://chatgpt.com/backend-api/codex/responses"
+            );
+        }
+        assert_eq!(
+            upstream_url(b, "/backend-api/ps/plugins/installed", true)
+                .unwrap()
+                .path(),
+            "/backend-api/ps/plugins/installed"
+        );
+        assert_eq!(
+            query_url(b, "/backend-api/wham/usage?x=1")
+                .unwrap()
+                .as_str(),
+            "https://chatgpt.com/backend-api/wham/usage?x=1"
+        );
+        for t in [
+            "//evil.com",
+            "/https://evil.com/backend-api/a",
+            "/https://chatgpt.com/backend-api-evil/a",
+            "/%2e%2e/secret",
+            "/x%5cy",
+            "/responses#secret",
+        ] {
+            assert!(upstream_url(b, t, true).is_err(), "{t}");
+        }
+    }
+}

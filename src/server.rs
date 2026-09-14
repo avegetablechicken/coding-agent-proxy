@@ -1,0 +1,596 @@
+use crate::{
+    Error, Result,
+    config::{Choice, Config, redacted_endpoint},
+    logger::{Logger, RequestLog},
+    routing::{MCP_PATH, MCP_UPSTREAM, account_query, query_url, upstream_url},
+};
+use bytes::{Buf, Bytes};
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, Full, Limited, StreamBody, combinators::UnsyncBoxBody};
+use hyper::{
+    HeaderMap, Request, Response,
+    body::{Frame, Incoming},
+    server::conn::http1,
+    service::service_fn,
+};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use serde_json::json;
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::{net::TcpListener, sync::Semaphore};
+use url::Url;
+
+pub type Body = UnsyncBoxBody<Bytes, std::io::Error>;
+pub struct Server {
+    pub config: Config,
+    pub logger: Arc<Logger>,
+    clients: Mutex<HashMap<String, reqwest::Client>>,
+}
+impl Server {
+    pub fn new(config: Config, logger: Arc<Logger>) -> Self {
+        Self {
+            config,
+            logger,
+            clients: Mutex::new(HashMap::new()),
+        }
+    }
+    fn client(&self, endpoint: &str) -> Result<reqwest::Client> {
+        let mut clients = self
+            .clients
+            .lock()
+            .map_err(|_| Error::config("Transport unavailable."))?;
+        if let Some(c) = clients.get(endpoint) {
+            return Ok(c.clone());
+        }
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs_f64(self.config.request_timeout_seconds))
+            .connect_timeout(Duration::from_secs_f64(self.config.request_timeout_seconds))
+            .pool_max_idle_per_host(8);
+        if endpoint != "none" {
+            // Remote DNS keeps destination resolution inside the selected SOCKS tunnel.
+            let proxy = if let Some(rest) = endpoint.strip_prefix("socks5://") {
+                format!("socks5h://{rest}")
+            } else {
+                endpoint.into()
+            };
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy)
+                    .map_err(|_| Error::config("Cannot configure outbound proxy."))?,
+            );
+        }
+        let client = builder
+            .build()
+            .map_err(|_| Error::config("Cannot initialize outbound transport."))?;
+        if clients.len() >= 32 {
+            clients.clear();
+        }
+        clients.insert(endpoint.into(), client.clone());
+        Ok(client)
+    }
+    async fn select(
+        &self,
+        choice: &Choice,
+        destination: &Url,
+        log: &mut RequestLog,
+    ) -> Result<String> {
+        if let Choice::One(n) = choice {
+            return Ok(n.clone());
+        }
+        let mut origin = destination.clone();
+        origin.set_path("/");
+        origin.set_query(None);
+        origin.set_fragment(None);
+        for name in choice.names() {
+            let endpoint = self.config.endpoint(name);
+            let available = match self
+                .client(endpoint)?
+                .head(origin.clone())
+                .timeout(Duration::from_secs_f64(
+                    self.config.request_timeout_seconds.min(5.0),
+                ))
+                .send()
+                .await
+            {
+                Ok(r) => (200..500).contains(&r.status().as_u16()) && r.status().as_u16() != 407,
+                Err(_) => false,
+            };
+            log.field("proxy", name);
+            log.field("proxy_endpoint", redacted_endpoint(endpoint));
+            log.field("available", available);
+            log.event("proxy_probe");
+            if available {
+                log.fields.remove("available");
+                return Ok(name.clone());
+            }
+        }
+        Err(Error::config(
+            "No available outbound proxy in the configured list.",
+        ))
+    }
+    pub async fn startup_log(&self) {
+        if !self.config.auth_file.is_empty() {
+            match crate::identity::Identity::read(&self.config.auth_file)
+                .and_then(|i| self.config.account_choice(&i).map(|p| (i, p)))
+            {
+                Ok((i, p)) => self.logger.write(
+                    "current_route",
+                    json!({"account_id":i.account_id,"proxy":p.label()})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                Err(e) => self.logger.write(
+                    "route_unavailable",
+                    json!({"reason":e.message}).as_object().unwrap().clone(),
+                ),
+            }
+        }
+        for p in &self.config.providers {
+            let event = if p
+                .credential(&self.config.base_url.api_key, true)
+                .await
+                .is_ok()
+            {
+                "current_route"
+            } else {
+                "route_unavailable"
+            };
+            self.logger.write(
+                event,
+                json!({"provider":p.label(),"proxy":p.proxy.label()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+    }
+    async fn handle(
+        self: Arc<Self>,
+        incoming: Request<Incoming>,
+    ) -> std::result::Result<Response<Body>, Infallible> {
+        let target = incoming
+            .uri()
+            .path_and_query()
+            .map(|v| v.as_str())
+            .unwrap_or("/")
+            .to_owned();
+        if incoming.method() == "GET" && target == "/health" {
+            return Ok(response(200, "{\"ok\":true}"));
+        }
+        let mut log=RequestLog { logger:self.logger.clone(), fields:json!({"request_id":uuid::Uuid::new_v4().to_string(),"method":incoming.method().as_str(),"path":target.split('?').next().unwrap_or("/")}).as_object().unwrap().clone(), started:Instant::now(),status:502,bytes:0,outcome:"request_failed" };
+        log.event("request_received");
+        match self.forward(incoming, &target, &mut log).await {
+            Ok(upstream) => {
+                let status = upstream.status();
+                log.status = status.as_u16();
+                log.field("status", status.as_u16());
+                log.field("headers_ms", log.started.elapsed().as_millis());
+                log.event("upstream_response");
+                let headers = filtered_headers(upstream.headers());
+                let no_body =
+                    log.fields["method"] == "HEAD" || matches!(status.as_u16(), 204 | 304);
+                let mut response = Response::builder().status(status);
+                *response.headers_mut().unwrap() = headers;
+                response
+                    .headers_mut()
+                    .unwrap()
+                    .insert("connection", "close".parse().unwrap());
+                if no_body {
+                    log.outcome = "request_finished";
+                    return Ok(response.body(empty()).unwrap());
+                }
+                let mut stream = upstream.bytes_stream();
+                let body = async_stream::stream! {
+                    // Owning the upstream stream here propagates disconnect cancellation and backpressure.
+                    while let Some(chunk)=stream.next().await {
+                        match chunk {
+                            Ok(bytes)=> { log.bytes+=bytes.len(); yield Ok::<_,std::io::Error>(Frame::data(bytes)); }
+                            Err(_)=> { log.field("reason","transport_error"); yield Err(std::io::Error::other("Upstream stream failed")); return; }
+                        }
+                    }
+                    log.outcome="request_finished";
+                    drop(log);
+                };
+                Ok(response.body(StreamBody::new(body).boxed_unsync()).unwrap())
+            }
+            Err(e) => {
+                log.status = e.status;
+                if e.status < 500 {
+                    log.outcome = "request_rejected";
+                }
+                log.field("reason", e.message);
+                Ok(response(
+                    e.status,
+                    &json!({"error":{"message":e.message}}).to_string(),
+                ))
+            }
+        }
+    }
+    async fn forward(
+        &self,
+        incoming: Request<Incoming>,
+        target: &str,
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response> {
+        if incoming
+            .headers()
+            .keys()
+            .any(|name| incoming.headers().get_all(name).iter().count() > 1)
+        {
+            return Err(Error::new(400, "Duplicate request header."));
+        }
+        if incoming
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .is_some_and(|n| n > 32 * 1024 * 1024)
+        {
+            return Err(Error::new(413, "Request body exceeds 32 MiB."));
+        }
+        if incoming.headers().contains_key("upgrade") {
+            return Err(Error::new(
+                426,
+                "Use HTTP/SSE; WebSocket upgrades are unsupported.",
+            ));
+        }
+        if incoming.headers().contains_key("expect") {
+            return Err(Error::new(417, "Expect is unsupported."));
+        }
+        if incoming.method() == "CONNECT"
+            || incoming.uri().scheme().is_some()
+            || incoming.uri().authority().is_some()
+        {
+            return Err(Error::new(
+                400,
+                "Only origin-form HTTP request targets are supported.",
+            ));
+        }
+        let path = target.split('?').next().unwrap_or("");
+        let docs = path == MCP_PATH;
+        let query = account_query(target);
+        let auth = incoming
+            .headers()
+            .get("authorization")
+            .and_then(|h| h.to_str().ok());
+        let account = incoming
+            .headers()
+            .get("chatgpt-account-id")
+            .and_then(|h| h.to_str().ok());
+        let (route, choice) = if docs {
+            match self.config.resolve(auth, false).await {
+                Ok(r) if account.is_none() || account == r.account_id.as_deref() => {
+                    let p = r.proxy.clone();
+                    (Some(r), p)
+                }
+                _ => (
+                    None,
+                    self.config
+                        .routing
+                        .mcp_fallback
+                        .clone()
+                        .unwrap_or_else(Choice::direct),
+                ),
+            }
+        } else {
+            let r = self.config.resolve(auth, true).await?;
+            if r.account_id.is_some() && account.is_some() && account != r.account_id.as_deref() {
+                return Err(Error::new(
+                    409,
+                    "Account changed; retry with the current login.",
+                ));
+            }
+            let p = r.proxy.clone();
+            (Some(r), p)
+        };
+        if let Some(r) = &route {
+            if let Some(id) = &r.account_id {
+                log.field("account_id", id);
+            }
+            if let Some(p) = &r.provider {
+                log.field("provider", p);
+            }
+        }
+        if path.starts_with("/mcp/") && !docs {
+            return Err(Error::new(404, "Unknown MCP endpoint."));
+        }
+        if docs && !matches!(incoming.method().as_str(), "GET" | "POST" | "DELETE") {
+            return Err(Error::new(405, "MCP supports GET, POST and DELETE."));
+        }
+        let url = if docs {
+            if target.contains('#') {
+                return Err(Error::config("Invalid MCP request target."));
+            }
+            log.field("service", "openaiDeveloperDocs");
+            log.field(
+                "routing",
+                if route.is_some() {
+                    "credential"
+                } else {
+                    "mcp_fallback"
+                },
+            );
+            Url::parse(&format!("{MCP_UPSTREAM}{}", &target[MCP_PATH.len()..]))
+                .map_err(|_| Error::config("Invalid MCP request target."))?
+        } else {
+            let r = route.as_ref().unwrap();
+            if query {
+                if r.account_id.is_none() {
+                    return Err(Error::new(
+                        403,
+                        "Account usage queries require a matched ChatGPT login credential.",
+                    ));
+                }
+                if incoming.method() != "GET" {
+                    return Err(Error::new(405, "Account usage queries support GET only."));
+                }
+                query_url(&r.upstream, target)?
+            } else {
+                upstream_url(&r.upstream, target, r.account_id.is_some())?
+            }
+        };
+        let (parts, body) = incoming.into_parts();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(30),
+            Limited::new(body, 32 * 1024 * 1024).collect(),
+        )
+        .await
+        .map_err(|_| Error::new(408, "Request body read timed out."))?
+        .map_err(|e| {
+            if e.is::<http_body_util::LengthLimitError>() {
+                Error::new(413, "Request body exceeds 32 MiB.")
+            } else {
+                Error::new(400, "Invalid HTTP request body.")
+            }
+        })?
+        .to_bytes();
+        let selected = self.select(&choice, &url, log).await?;
+        let endpoint = self.config.endpoint(&selected);
+        log.field("proxy", selected);
+        log.field("proxy_endpoint", redacted_endpoint(endpoint));
+        log.event("route_selected");
+        let mut headers = filtered_headers(&parts.headers);
+        if docs {
+            let allowed = [
+                "accept",
+                "content-type",
+                "mcp-session-id",
+                "mcp-protocol-version",
+                "last-event-id",
+            ];
+            let names: Vec<_> = headers
+                .keys()
+                .filter(|n| !allowed.contains(&n.as_str()))
+                .cloned()
+                .collect();
+            for n in names {
+                headers.remove(n);
+            }
+        }
+        if !docs {
+            let r = route.unwrap();
+            headers.insert(
+                "authorization",
+                format!("Bearer {}", r.token)
+                    .parse()
+                    .map_err(|_| Error::new(401, "Invalid credential."))?,
+            );
+            if let Some(id) = r.account_id {
+                headers.insert(
+                    "chatgpt-account-id",
+                    id.parse()
+                        .map_err(|_| Error::new(401, "Invalid account ID."))?,
+                );
+            }
+        }
+        headers.insert("accept-encoding", "identity".parse().unwrap());
+        self.client(endpoint)?
+            .request(parts.method, url)
+            .headers(headers)
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|_| {
+                Error::config("Upstream transport failed; no direct fallback was attempted.")
+            })
+    }
+    pub async fn serve(
+        self: Arc<Self>,
+        listener: TcpListener,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> std::io::Result<()> {
+        let limit = Arc::new(Semaphore::new(128));
+        let mut tasks = tokio::task::JoinSet::new();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _=&mut shutdown=>break,
+                Some(_)=tasks.join_next(), if !tasks.is_empty()=>{},
+                accepted=listener.accept()=> {
+                    let (socket,_)=accepted?;
+                    let Ok(permit)=limit.clone().try_acquire_owned() else { drop(socket); continue; };
+                    socket.set_nodelay(true)?;
+                    let server=self.clone();
+                tasks.spawn(async move {
+                    let _permit=permit;
+                    let mut socket=socket;
+                    let prefix=match tokio::time::timeout(Duration::from_secs(30), read_head(&mut socket)).await {
+                        Ok(Ok(prefix))=>prefix,
+                        result=> {
+                            let status=match result { Ok(Err(e))=>e.status, _=>408 };
+                            use tokio::io::AsyncWriteExt;
+                            let _=socket.write_all(format!("HTTP/1.1 {status} Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await;
+                            return;
+                        }
+                    };
+                    let _=http1::Builder::new().keep_alive(false).max_buf_size(65536).timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(30))
+                        .serve_connection(TokioIo::new(PrefixedSocket { prefix, socket }),service_fn(move |r|server.clone().handle(r))).await;
+                    });
+                }
+            }
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        Ok(())
+    }
+}
+
+// Reject ambiguity before Hyper normalizes duplicate Content-Length or TE+CL.
+// Buffered bytes (including any body prefix) are then passed to Hyper unchanged.
+async fn read_head(socket: &mut tokio::net::TcpStream) -> Result<Bytes> {
+    use tokio::io::AsyncReadExt;
+    let mut data = Vec::with_capacity(8192);
+    loop {
+        let mut chunk = [0; 8192];
+        let n = socket
+            .read(&mut chunk)
+            .await
+            .map_err(|_| Error::new(400, "Invalid request headers."))?;
+        if n == 0 {
+            return Err(Error::new(400, "Incomplete request headers."));
+        }
+        data.extend_from_slice(&chunk[..n]);
+        if let Some(end) = data.windows(4).position(|s| s == b"\r\n\r\n") {
+            if end + 4 > 65536 {
+                return Err(Error::new(431, "Headers exceed 64 KiB."));
+            }
+            let head = std::str::from_utf8(&data[..end])
+                .map_err(|_| Error::new(400, "Invalid request headers."))?;
+            let mut names = std::collections::HashSet::new();
+            for line in head.split("\r\n").skip(1) {
+                let (name, value) = line
+                    .split_once(':')
+                    .ok_or(Error::new(400, "Invalid request header."))?;
+                let name = name.to_ascii_lowercase();
+                if !names.insert(name.clone()) {
+                    return Err(Error::new(400, "Duplicate request header."));
+                }
+                if name == "transfer-encoding" && !value.trim().eq_ignore_ascii_case("chunked") {
+                    return Err(Error::new(400, "Unsupported body framing."));
+                }
+                if name == "content-length" {
+                    let v = value.trim();
+                    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(Error::new(400, "Invalid Content-Length."));
+                    }
+                    if v.parse::<u64>().map_or(true, |n| n > 32 * 1024 * 1024) {
+                        return Err(Error::new(413, "Body exceeds 32 MiB."));
+                    }
+                }
+            }
+            if names.contains("transfer-encoding") && names.contains("content-length") {
+                return Err(Error::new(400, "Ambiguous body framing."));
+            }
+            if names.contains("expect") {
+                return Err(Error::new(417, "Expect is unsupported."));
+            }
+            return Ok(Bytes::from(data));
+        }
+        if data.len() > 65536 {
+            return Err(Error::new(431, "Headers exceed 64 KiB."));
+        }
+    }
+}
+struct PrefixedSocket {
+    prefix: Bytes,
+    socket: tokio::net::TcpStream,
+}
+impl tokio::io::AsyncRead for PrefixedSocket {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.prefix.is_empty() {
+            let n = buf.remaining().min(self.prefix.len());
+            buf.put_slice(&self.prefix[..n]);
+            self.prefix.advance(n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.socket).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for PrefixedSocket {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.socket).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.socket).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.socket).poll_shutdown(cx)
+    }
+}
+pub fn filtered_headers(source: &HeaderMap) -> HeaderMap {
+    let mut excluded: Vec<String> = [
+        "host",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "authorization",
+        "x-api-key",
+        "api-key",
+        "chatgpt-account-id",
+        "cookie",
+        "accept-encoding",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    for h in source.get_all("connection") {
+        if let Ok(s) = h.to_str() {
+            excluded.extend(s.split(',').map(|s| s.trim().to_ascii_lowercase()));
+        }
+    }
+    let mut result = HeaderMap::new();
+    for (n, v) in source {
+        if !excluded.iter().any(|s| s == n.as_str()) {
+            result.append(n.clone(), v.clone());
+        }
+    }
+    result
+}
+fn empty() -> Body {
+    Full::new(Bytes::new())
+        .map_err(|e: Infallible| match e {})
+        .boxed_unsync()
+}
+fn response(status: u16, text: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("connection", "close")
+        .body(
+            Full::new(Bytes::copy_from_slice(text.as_bytes()))
+                .map_err(|e: Infallible| match e {})
+                .boxed_unsync(),
+        )
+        .unwrap()
+}
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod tests;

@@ -1,18 +1,29 @@
 # coding-agent-proxy
 
-A macOS loopback reverse proxy for Codex model requests, ChatGPT account APIs and
+A cross-platform Rust loopback reverse proxy for Codex model requests, ChatGPT account APIs and
 OpenAI documentation MCP. It selects an outbound proxy by matching ChatGPT or
 API Key credentials. HTTP/SSE data is passed through without model or protocol conversion.
 
 ## Configuration
 
-Requires macOS 14+, Swift 6+, and Homebrew Python 3.11+ when reading Codex provider
-metadata. Build and create a local configuration:
+Build with Rust 1.85+ and Cargo on macOS, Linux, or Windows. The Rust executable
+reads Codex TOML directly and needs neither Swift nor Python at runtime. Python
+3.10+ is only needed for the optional service manager and integration tests.
+The Swift implementation remains in `Sources/` as a migration reference.
+
+Build and create a local configuration:
 
 ```sh
-swift build -c release
+cargo build --locked --release
 cp config.example.yaml config.yaml
 ```
+
+On Windows PowerShell, use `Copy-Item config.example.yaml config.yaml` and
+`./target/release/coding-agent-proxy.exe` in place of the Unix executable path.
+
+The implementation and offline tests have been run on macOS. CI is configured to
+build, test, and package native binaries on macOS, Linux, and Windows; a platform
+is not considered verified until its CI job passes.
 
 ```yaml
 listen_port: 7889
@@ -144,17 +155,21 @@ YAML is loaded once at startup. Account mappings, upstreams, proxy credentials,
 fallbacks and timeouts require a restart after editing. `auth.json` is read per request so credential rotation can take effect without restart.
 Codex provider configuration lookup retains its existing request-time behavior.
 
-For environment-backed API Keys, process variables take priority. If a variable
+For environment-backed API Keys, process variables take priority. On macOS and Linux, if a variable
 is absent, the service runs the user's login/interactive zsh, bash or sh at
 request time and reads that one exported variable. For zsh this follows the usual
 `.zshenv`, `.zprofile`, `.zshrc` and `.zlogin` loading rules. Startup output is
 ignored; lookup times out after 3 seconds and never logs values. Shell scripts
 must complete without terminal interaction. Requests already matched to a
-ChatGPT login do not start a shell to resolve unrelated API keys.
+ChatGPT login do not start a shell to resolve unrelated API keys. Windows reads
+API Keys from the process environment; it does not execute PowerShell profiles.
+For example, set `$env:OPENAI_API_KEY` before starting the executable in PowerShell.
+Use `~/...` paths or forward slashes in YAML; Windows backslashes must be escaped
+inside double-quoted YAML strings. Keychain-only credentials remain unsupported.
 
 ```sh
-.build/release/coding-agent-proxy --config config.yaml --check
-.build/release/coding-agent-proxy --config config.yaml
+target/release/coding-agent-proxy --config config.yaml --check
+target/release/coding-agent-proxy --config config.yaml
 ```
 
 `--check` validates configuration and credentials, not proxy reachability. Stop
@@ -169,8 +184,8 @@ Do not mix old upstream keys with `base_url`, or old routing keys with `routing`
 The migration command writes a private file without printing its credentials:
 
 ```sh
-.build/release/coding-agent-proxy --config config.yaml --write-config config.new.yaml
-.build/release/coding-agent-proxy --config config.new.yaml --check
+target/release/coding-agent-proxy --config config.yaml --write-config config.new.yaml
+target/release/coding-agent-proxy --config config.new.yaml --check
 ```
 
 It converts old API Key object lists to mapping keys when representable. Entries
@@ -223,36 +238,59 @@ public MCP upstream. MCP session/protocol headers, JSON and SSE are preserved.
 
 ## Run as a background service
 
-```sh
-python3 scripts/service.py install
-python3 scripts/service.py status
-```
-
-The launchd job `local.coding-agent-proxy` runs at login and restarts after exits.
-Runtime files live in `~/Library/Application Support/coding-agent-proxy`.
-Installation copies `config.yaml` once; updates preserve the runtime config.
-Edit that copy and restart to apply changes. Absolute credential paths are
-recommended. The supervisor can start Homebrew mihomo if it is not already running.
-Existing listeners are left untouched; the supervisor waits for the port to become free.
-
-After code changes:
+Build the Rust release executable, prepare `config.yaml`, and run:
 
 ```sh
-swift build -c release
-python3 scripts/service.py update
-python3 scripts/service.py restart
+python3 scripts/service_rust.py install
+python3 scripts/service_rust.py status
 ```
 
-`update` copies the executable and supervisor without restarting. `restart`
-briefly interrupts active requests. `uninstall` removes service registration
-while retaining configuration and logs.
+Use `python` instead of `python3` on Windows if needed. The installer copies the
+executable and initial configuration into a per-user runtime directory. It runs
+the native executable directly, without a Python supervisor:
+
+| Platform | Background runner | Runtime directory |
+| --- | --- | --- |
+| macOS | launchd user agent | `~/Library/Application Support/coding-agent-proxy-rust` |
+| Linux | systemd user service | `$XDG_DATA_HOME/coding-agent-proxy-rust`, default `~/.local/share/coding-agent-proxy-rust` |
+| Windows | Task Scheduler task at user logon | `%LOCALAPPDATA%/coding-agent-proxy-rust` |
+
+The Windows task runs in the logged-in user's session; it is not a system service
+that runs before login. Linux requires an available systemd user manager. On all
+platforms, manage mihomo/Clash separately; the Rust service manager does not start
+an external proxy core. Native registration on Linux and Windows still needs
+validation on those operating systems.
+
+The service/task name is `local.coding-agent-proxy.rust`, separate from the legacy
+Swift job. Stop any existing listener on the configured port before installing.
+The script never stops the legacy Swift job or changes its runtime configuration.
+Use `--binary /path/to/executable` and `--config /path/to/config.yaml` to install
+from other locations.
+
+Edit the runtime copy of `config.yaml`, then restart to apply changes. Updates
+preserve that copy. Absolute credential paths are recommended. Linux services can
+load exported API Keys and `CODEX_HOME` from a private `service.env` file beside
+that runtime config, using systemd EnvironmentFile syntax. Windows API Keys must
+be available in the scheduled task's process environment.
+
+```sh
+cargo build --locked --release
+python3 scripts/service_rust.py update
+python3 scripts/service_rust.py restart
+```
+
+On Windows, run `stop` before `update` because Windows locks running executables,
+then run `restart`. On Unix, `update` stages the new executable without restarting.
+`stop`, `status`, `restart`, and `uninstall` operate only on the Rust registration.
+`uninstall` retains configuration and logs. Logs are under `logs/proxy.log` in the
+runtime directory. Restart briefly interrupts active requests.
 
 ```sh
 curl --noproxy '*' http://127.0.0.1:7889/health
-tail -F "$HOME/Library/Application Support/coding-agent-proxy/logs/proxy.log"
 ```
 
 Health confirms that the listener is running, not upstream connectivity.
+The old `scripts/service.py` remains available only for the Swift implementation.
 
 ## Proxy username/password authentication
 
@@ -265,7 +303,7 @@ proxies:
   authenticated_socks: "socks5://proxy-user:proxy-password@proxy.example.com:1080"
 ```
 
-The system networking stack supplies the credentials to the proxy, separately
+The Rust HTTP transport supplies the credentials to the proxy, separately
 from the model request's Bearer token. Percent-encode reserved characters in
 usernames/passwords: for example, `user@example` and `p:ss@word` become
 `user%40example:p%3Ass%40word`. Supply both fields; an empty password is accepted
@@ -405,7 +443,7 @@ Logs are written to stderr and to `logs/proxy.log` beside the application config
 tail -F logs/proxy.log
 ```
 
-Each line is JSON with a UTC timestamp. Log files use mode `0600`, rotate at 5 MiB, and retain one backup as `proxy.log.1`. If file logging fails, the service reports it on stderr and continues console logging.
+Each line is JSON with a UTC timestamp. Log files rotate at 5 MiB and retain one backup as `proxy.log.1`. Unix files use mode `0600`; Windows files inherit directory ACLs, so keep them in your private user directory. If file logging fails, the service reports it on stderr and continues console logging.
 
 | Event | Meaning |
 | --- | --- |
@@ -421,11 +459,11 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 
 ## Limits and troubleshooting
 
-- The upstream must use HTTPS and a public service hostname. IP addresses and local hostnames are rejected because URLSession can implicitly bypass proxies for loopback destinations.
+- The upstream must use HTTPS and a public service hostname. IP addresses and local hostnames are rejected to preserve the existing upstream validation policy.
 - Proxy URLs require an explicit port and support `http`, `https`, or `socks5`. Optional username/password authentication uses `scheme://username:password@host:port`. Credentials are removed from logged proxy URLs.
 - Inbound limits: 32 MiB request body, 64 KiB headers, 128 concurrent connections, and a 30-second read timeout. Content-Length and chunked uploads are supported; each connection handles one request.
 - `Expect: 100-continue` returns HTTP 417. WebSocket Upgrade returns HTTP 426.
-- SSE is flushed at line boundaries or 16 KiB; ordinary responses use 16 KiB chunks. URLSession may add its own internal buffering.
+- Upstream response chunks, including SSE, are forwarded as they arrive with backpressure. There is no whole-response buffering or automatic decompression. Content-Encoding is preserved when returned by an upstream.
 - `request_timeout_seconds` accepts 1–3600 seconds and configures both the upstream request timeout and the total resource timeout. A failure after streaming starts closes the connection without inserting a JSON error into the stream.
 - Local HTTP 401 means the Bearer token is missing/malformed, or no credential matches and OpenAI fallback is disabled. HTTP 409 means the account header does not match or the token matches multiple routes. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body.
 - If a mihomo listener refuses connections, confirm the effective profile contains it, its node name is valid, and the port is not occupied. If the exit changes unexpectedly, inspect the listener's node/group selection.
@@ -434,24 +472,39 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 ## Development
 
 ```sh
-swift build
-swift test
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked
 python3 scripts/integration.py
 python3 scripts/test_proxy_auth.py
+python3 scripts/test_service_rust.py
 ```
 
-Swift tests cover configuration, identity validation, path mapping, HTTP framing, header filtering, logging, and early SSE delivery. The Python integration test uses synthetic credentials and local CONNECT probes to verify route selection, startup configuration snapshots and restarts, authentication rejection, missing mappings, logging, explicit OpenAI fallback through its designated proxy, and refusal without a configured fallback. These tests do not call a real model or prove live provider connectivity.
+Tests use synthetic credentials and loopback sockets. Rust tests cover TLS and
+HTTP/HTTPS CONNECT, early SSE delivery, proxy selection, request framing, and
+MCP credential isolation. Python integration tests cover account/API Key routing,
+credential refresh, configuration snapshots, migration, fallback refusal and
+HTTP/SOCKS5 authentication. They do not call a real model. CI runs these checks
+and builds release binaries for all three operating systems.
+
+The Python transport tests default to `target/debug/coding-agent-proxy` (with
+`.exe` on Windows). Set `CODING_AGENT_PROXY_BINARY` to test another build, including
+the legacy Swift binary. Existing Swift tests can still run with `swift test` on
+macOS; `scripts/service.py` and `scripts/test_service.py` remain the legacy pair.
 
 | File | Responsibility |
 | --- | --- |
-| `Sources/RegionProxy/main.swift` | CLI, startup, and process lifecycle. |
-| `Sources/RegionProxyCore/Configuration.swift` | YAML validation, credentials, and proxy mappings. |
-| `Sources/RegionProxyCore/Forwarder.swift` | Identity source abstraction and upstream transport. |
-| `Sources/RegionProxyCore/HTTP.swift` | Local HTTP listener and framing. |
-| `Sources/RegionProxyCore/RequestLogger.swift` | Structured logs and rotation. |
+| `src/main.rs` | CLI, private config migration, startup and shutdown |
+| `src/config.rs` | YAML compatibility and validation |
+| `src/identity.rs` | Account metadata, native TOML parsing, environment and shell credentials |
+| `src/routing.rs` | Credential matching, upstream URL mapping |
+| `src/server.rs` | Bounded HTTP listener, proxy selection, TLS and streaming |
+| `src/logger.rs` | Redacted structured logs and rotation |
+| `scripts/service_rust.py` | Per-user platform service management |
 
 ## Acknowledgments
 
-Special thanks to **[Copool](https://github.com/AlickH/Copool)** and its contributors. Copool's local proxy implementation informed the technology choices here: Swift 6, Network.framework (`NWListener` / `NWConnection`), `URLSession.AsyncBytes`, and per-session `ProxyConfiguration`. This project's HTTP parsing and account routing are implemented separately; it does not include Copool's account pool, account rotation, quota management, model mapping, or protocol conversion features.
+Special thanks to **[Copool](https://github.com/AlickH/Copool)** and its contributors. Copool's local proxy implementation informed the original Swift version's technology choices: Network.framework, URLSession.AsyncBytes, and per-session ProxyConfiguration. The cross-platform version uses Tokio, Hyper, reqwest and rustls. This project's HTTP parsing and account routing are implemented separately; it does not include Copool's account pool, account rotation, quota management, model mapping, or protocol conversion features.
 
-Thanks also to [Yams](https://github.com/jpsim/Yams) for YAML parsing and [mihomo](https://github.com/MetaCubeX/mihomo) for the proxy core used in the multi-listener setup.
+The legacy Swift version uses [Yams](https://github.com/jpsim/Yams) for YAML parsing and [mihomo](https://github.com/MetaCubeX/mihomo) for the proxy core used in the multi-listener setup.
