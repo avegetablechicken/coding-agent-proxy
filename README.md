@@ -7,9 +7,8 @@ API Key credentials. HTTP/SSE data is passed through without model or protocol c
 ## Configuration
 
 Build with Rust 1.85+ and Cargo on macOS, Linux, or Windows. The Rust executable
-reads Codex TOML directly and needs neither Swift nor Python at runtime. Python
-3.10+ is only needed for the optional service manager and integration tests.
-The Swift implementation remains in `Sources/` as a migration reference.
+reads Codex TOML directly and has no Python runtime dependency. Python 3.10+ is
+only needed for the optional service manager and integration tests.
 
 Build and create a local configuration:
 
@@ -261,9 +260,9 @@ platforms, manage mihomo/Clash separately; the Rust service manager does not sta
 an external proxy core. Native registration on Linux and Windows still needs
 validation on those operating systems.
 
-The service/task name is `local.coding-agent-proxy.rust`, separate from the legacy
-Swift job. Stop any existing listener on the configured port before installing.
-The script never stops the legacy Swift job or changes its runtime configuration.
+The service/task name is `local.coding-agent-proxy.rust`. Stop any existing
+listener on the configured port before installing. The script manages only its
+own service registration and runtime directory.
 Use `--binary /path/to/executable` and `--config /path/to/config.yaml` to install
 from other locations.
 
@@ -290,7 +289,6 @@ curl --noproxy '*' http://127.0.0.1:7889/health
 ```
 
 Health confirms that the listener is running, not upstream connectivity.
-The old `scripts/service.py` remains available only for the Swift implementation.
 
 ## Proxy username/password authentication
 
@@ -489,9 +487,8 @@ HTTP/SOCKS5 authentication. They do not call a real model. CI runs these checks
 and builds release binaries for all three operating systems.
 
 The Python transport tests default to `target/debug/coding-agent-proxy` (with
-`.exe` on Windows). Set `CODING_AGENT_PROXY_BINARY` to test another build, including
-the legacy Swift binary. Existing Swift tests can still run with `swift test` on
-macOS; `scripts/service.py` and `scripts/test_service.py` remain the legacy pair.
+`.exe` on Windows). Set `CODING_AGENT_PROXY_BINARY` to test another build, such as
+the release executable.
 
 | File | Responsibility |
 | --- | --- |
@@ -505,6 +502,6 @@ macOS; `scripts/service.py` and `scripts/test_service.py` remain the legacy pair
 
 ## Acknowledgments
 
-Special thanks to **[Copool](https://github.com/AlickH/Copool)** and its contributors. Copool's local proxy implementation informed the original Swift version's technology choices: Network.framework, URLSession.AsyncBytes, and per-session ProxyConfiguration. The cross-platform version uses Tokio, Hyper, reqwest and rustls. This project's HTTP parsing and account routing are implemented separately; it does not include Copool's account pool, account rotation, quota management, model mapping, or protocol conversion features.
+Special thanks to **[Copool](https://github.com/AlickH/Copool)** and its contributors. Copool's local proxy implementation informed this project's design. This implementation uses Tokio, Hyper, reqwest and rustls. This project's HTTP parsing and account routing are implemented separately; it does not include Copool's account pool, account rotation, quota management, model mapping, or protocol conversion features.
 
-The legacy Swift version uses [Yams](https://github.com/jpsim/Yams) for YAML parsing and [mihomo](https://github.com/MetaCubeX/mihomo) for the proxy core used in the multi-listener setup.
+Thanks also to [mihomo](https://github.com/MetaCubeX/mihomo) for the proxy core used in the multi-listener setup.
