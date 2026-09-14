@@ -55,6 +55,58 @@ final class UsernameRoutingTests: XCTestCase {
         XCTAssertEqual(try config("    new@example.com: none\n    my-login: jp").proxyName(for: login), "none")
     }
 
+    func testAuthFileRestrictionDefaultsAndOpenMode() throws {
+        let token = try jwt(["https://api.openai.com/auth": ["chatgpt_account_id": "other-id"],
+                             "https://api.openai.com/profile": ["email": "other@example.com"]])
+        let source = """
+        listen_port: 7889
+        request_timeout_seconds: 30
+        auth_file: /missing/auth.json
+        routing:
+          account:
+            other@example.com: none
+        """
+        let restricted = try Configuration.parse(source)
+        XCTAssertTrue(restricted.account_auth_file_only)
+        XCTAssertThrowsError(try restricted.resolveRoute(authorization: "Bearer \(token)", loadIdentity: {
+            Identity(accountID: "local-id", accessToken: "saved-token")
+        }))
+        XCTAssertThrowsError(try restricted.checkCredentials())
+        for yaml in [source, source.replacingOccurrences(of: "auth_file: /missing/auth.json\n", with: "")] {
+            let open = try Configuration.parse(yaml + "\naccount_auth_file_only: false")
+            XCTAssertFalse(open.account_auth_file_only)
+            XCTAssertNoThrow(try open.checkCredentials())
+            let route = try open.resolveRoute(authorization: "Bearer \(token)")
+            XCTAssertEqual(route.accountID, "other-id")
+            XCTAssertEqual(route.token, token)
+            XCTAssertEqual(route.proxy, "none")
+            XCTAssertEqual(route.upstream, "https://chatgpt.com/backend-api")
+            XCTAssertNil(open.resolveMCPRoute(authorization: "Bearer \(token)", accountID: "wrong-id").credential)
+            XCTAssertEqual(open.resolveMCPRoute(authorization: "Bearer \(token)", accountID: "other-id").credential?.accountID, "other-id")
+            XCTAssertFalse(try Configuration.parse(open.canonicalYAML()).account_auth_file_only)
+        }
+        XCTAssertThrowsError(try Configuration.parse(source + "\naccount_auth_file_only: maybe"))
+    }
+
+    func testOpenModeAccountFallbackAndMalformedTokens() throws {
+        let open = try Configuration.parse("""
+        listen_port: 7889
+        request_timeout_seconds: 30
+        account_auth_file_only: false
+        routing:
+          account_fallback: none
+        """)
+        let token = try jwt(["https://api.openai.com/auth": ["chatgpt_account_id": "other-id"]])
+        XCTAssertEqual(try open.resolveRoute(authorization: "Bearer \(token)").accountID, "other-id")
+        for token in ["opaque-token", "a.@@@.c", try jwt(["email": "other@example.com"]),
+                      try jwt(["https://api.openai.com/auth": ["chatgpt_account_id": "bad\nheader"]])] {
+            XCTAssertThrowsError(try open.resolveRoute(authorization: "Bearer \(token)"))
+        }
+        XCTAssertThrowsError(try open.resolveRoute(authorization: nil))
+        let disabled = try Configuration.parse("listen_port: 7889\nrequest_timeout_seconds: 30\naccount_auth_file_only: false")
+        XCTAssertThrowsError(try disabled.resolveRoute(authorization: "Bearer \(token)"))
+    }
+
     func testMissingOrMalformedMetadataPreservesIDAndFallback() throws {
         for token in [nil, "broken", "a.@@@.c", "a.W10.c", "a.e30.c"] as [String?] {
             let login = try identity(id: token)

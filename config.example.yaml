@@ -1,6 +1,9 @@
 # Copy to config.yaml. YAML is loaded once; restart after changing it.
 listen_port: 8787
 auth_file: "~/.codex/auth.json"
+# Default true: only accept the ChatGPT credential saved in auth_file.
+# Set false to route other ChatGPT access tokens; auth_file becomes optional.
+account_auth_file_only: true
 request_timeout_seconds: 300
 
 base_url:

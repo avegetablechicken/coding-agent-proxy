@@ -58,12 +58,24 @@ priority over its top-level claims, then the ID token's claims. Use email when
 possible; display names may be shared by multiple accounts. If no key matches,
 `account_fallback` applies as before.
 
-A request must still match the saved access token; a supplied account header
+By default (`account_auth_file_only: true`), a request must match the saved access token; a supplied account header
 must match the actual account ID, even when routing by email. Username metadata
 is read from `auth.json` on each request, so login changes take effect immediately.
 Missing or malformed token metadata leaves ID routing and fallback available.
 Credentials stored only in a keychain are unsupported. Codex remains responsible
 for login and token refresh.
+
+Set top-level `account_auth_file_only: false` to accept other ChatGPT access tokens.
+In this mode `auth_file` may be omitted or unavailable. The service decodes the
+incoming access token's `https://api.openai.com/auth.chatgpt_account_id` and profile
+metadata to select the account ID/email/username route, or `account_fallback`.
+The supplied account header must still match that token's account ID. Decoded
+claims are routing hints, not local signature verification; the ChatGPT upstream
+validates the forwarded token. Email routing requires email in that access token;
+the service cannot recover another account's ID token or look up email addresses.
+Configured API Key routes and API/MCP fallbacks retain their existing behavior.
+`--check` in this mode checks configuration and API Key sources without requiring
+a saved ChatGPT login. Restart the service after changing this setting.
 
 `routing.api_key` is a list so multiple keys can share a provider but select
 different proxies. Each entry has `proxy`, a `name` and/or `api_key_env`, and

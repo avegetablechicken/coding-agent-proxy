@@ -11,6 +11,7 @@ public struct ProxyError: Error, LocalizedError, Sendable {
 public struct Configuration: Decodable, Sendable {
     public let listen_port: UInt16
     public let auth_file: String
+    public let account_auth_file_only: Bool
     public let account_upstream_base_url: String
     public let api_key_upstream_base_url: String
     public let request_timeout_seconds: Double
@@ -22,7 +23,7 @@ public struct Configuration: Decodable, Sendable {
     public let mcp_fallback_proxy: ProxyChoice?
 
     enum CodingKeys: String, CodingKey {
-        case base_url, routing, listen_port, auth_file, account_upstream_base_url, upstream_base_url, request_timeout_seconds, proxies, accounts, api_key_providers, openai_fallback_proxy, api_key_upstream_base_url, mcp_fallback_proxy
+        case base_url, routing, listen_port, auth_file, account_auth_file_only, account_upstream_base_url, upstream_base_url, request_timeout_seconds, proxies, accounts, api_key_providers, openai_fallback_proxy, api_key_upstream_base_url, mcp_fallback_proxy
     }
 
     private struct BaseURLs: Codable {
@@ -50,6 +51,7 @@ public struct Configuration: Decodable, Sendable {
         }
         listen_port = try values.decode(UInt16.self, forKey: .listen_port)
         auth_file = try values.decodeIfPresent(String.self, forKey: .auth_file) ?? ""
+        account_auth_file_only = try values.decodeIfPresent(Bool.self, forKey: .account_auth_file_only) ?? true
         guard !(values.contains(.account_upstream_base_url) && values.contains(.upstream_base_url)) else {
             throw ProxyError("Use account_upstream_base_url only; do not also set legacy upstream_base_url.")
         }
@@ -76,6 +78,7 @@ public struct Configuration: Decodable, Sendable {
         struct Output: Encodable {
             let listen_port: UInt16
             let auth_file: String?
+            let account_auth_file_only: Bool
             let request_timeout_seconds: Double
             let base_url: BaseURLs
             let proxies: [String: String]
@@ -84,6 +87,7 @@ public struct Configuration: Decodable, Sendable {
         let accountBase = account_upstream_base_url.hasSuffix("/backend-api/codex")
             ? String(account_upstream_base_url.dropLast("/codex".count)) : account_upstream_base_url
         return try YAMLEncoder().encode(Output(listen_port: listen_port, auth_file: auth_file.isEmpty ? nil : auth_file,
+            account_auth_file_only: account_auth_file_only,
             request_timeout_seconds: request_timeout_seconds,
             base_url: BaseURLs(account: accountBase, api_key: api_key_upstream_base_url), proxies: proxies,
             routing: Routing(account: accounts.isEmpty ? nil : accounts, api_key: providers.isEmpty ? nil : providers,
@@ -94,7 +98,7 @@ public struct Configuration: Decodable, Sendable {
     public static func parse(_ text: String) throws -> Configuration {
         let result: Configuration
         do {
-            let allowed: Set<String> = ["base_url", "routing", "listen_port", "auth_file", "account_upstream_base_url", "upstream_base_url", "request_timeout_seconds", "proxies", "accounts", "api_key_providers", "openai_fallback_proxy", "api_key_upstream_base_url", "mcp_fallback_proxy"]
+            let allowed: Set<String> = ["base_url", "routing", "listen_port", "auth_file", "account_auth_file_only", "account_upstream_base_url", "upstream_base_url", "request_timeout_seconds", "proxies", "accounts", "api_key_providers", "openai_fallback_proxy", "api_key_upstream_base_url", "mcp_fallback_proxy"]
             guard let root = try compose(yaml: text)?.mapping,
                   root.keys.allSatisfy({ $0.string.map { allowed.contains($0) } == true }) else {
                 throw ProxyError("Unknown configuration field.")
@@ -124,7 +128,9 @@ public struct Configuration: Decodable, Sendable {
               (1...3600).contains(result.request_timeout_seconds) else { throw ProxyError("Invalid port or timeout (1–3600 seconds).") }
         try validateUpstream(result.account_upstream_base_url)
         try validateUpstream(result.api_key_upstream_base_url)
-        guard result.auth_file.isEmpty == (result.accounts.isEmpty && result.account_fallback_proxy == nil) else {
+        let hasAccountRouting = !result.accounts.isEmpty || result.account_fallback_proxy != nil
+        guard (result.auth_file.isEmpty || hasAccountRouting),
+              (!result.account_auth_file_only || !hasAccountRouting || !result.auth_file.isEmpty) else {
             throw ProxyError("ChatGPT routing requires auth_file and account mappings or account_fallback.")
         }
         for (name, value) in result.proxies {
@@ -260,6 +266,10 @@ public struct Configuration: Decodable, Sendable {
                 if token == identity.accessToken { matchedIdentity = identity }
             } catch { unavailable = true }
         }
+        if matchedIdentity == nil, !account_auth_file_only,
+           !accounts.isEmpty || account_fallback_proxy != nil {
+            matchedIdentity = Identity.fromAccessToken(token)
+        }
         for provider in providers {
             do {
                 let credential = try provider.resolveCredential(defaultUpstream: api_key_upstream_base_url, allowShellLookup: matchedIdentity == nil)
@@ -300,7 +310,7 @@ public struct Configuration: Decodable, Sendable {
 
     public func checkCredentials() throws {
         var keys = Set<String>()
-        if !auth_file.isEmpty {
+        if account_auth_file_only, !auth_file.isEmpty {
             let identity = try self.identity()
             _ = try proxyName(for: identity)
             keys.insert(identity.accessToken)
@@ -429,7 +439,7 @@ public struct Identity: Sendable {
         self.usernames = usernames
     }
 
-    // Metadata comes only from the saved login, never from an incoming JWT.
+    // Decode routing metadata only; upstream validates token authenticity.
     private static func claims(_ token: String?) -> [String: Any] {
         guard let token else { return [:] }
         let parts = token.split(separator: ".", omittingEmptySubsequences: false)
@@ -452,16 +462,27 @@ public struct Identity: Sendable {
               !auth.tokens.access_token.contains(where: { $0.isWhitespace || $0.isNewline }) else {
             throw ProxyError("auth_file requires nonempty tokens.account_id and tokens.access_token (ChatGPT login).")
         }
-        let accessClaims = claims(auth.tokens.access_token)
+        return Identity(accountID: auth.tokens.account_id, accessToken: auth.tokens.access_token,
+                        usernames: usernames(accessClaims: claims(auth.tokens.access_token), idClaims: claims(auth.tokens.id_token)))
+    }
+
+    /// Used only when account_auth_file_only is explicitly disabled.
+    static func fromAccessToken(_ token: String) -> Identity? {
+        let accessClaims = claims(token)
+        guard let auth = accessClaims["https://api.openai.com/auth"] as? [String: Any],
+              let id = auth["chatgpt_account_id"] as? String, !id.isEmpty,
+              id.unicodeScalars.allSatisfy({ $0.value > 32 && $0.value < 127 }) else { return nil }
+        return Identity(accountID: id, accessToken: token, usernames: usernames(accessClaims: accessClaims))
+    }
+
+    private static func usernames(accessClaims: [String: Any], idClaims: [String: Any] = [:]) -> [String] {
         let profile = accessClaims["https://api.openai.com/profile"] as? [String: Any] ?? [:]
-        let idClaims = claims(auth.tokens.id_token)
-        let usernames = ["email", "preferred_username", "name"].compactMap { key -> String? in
+        return ["email", "preferred_username", "name"].compactMap { key -> String? in
             let value = (profile[key] as? String) ?? (accessClaims[key] as? String) ?? (idClaims[key] as? String)
             guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
             return value
         }
-        return Identity(accountID: auth.tokens.account_id, accessToken: auth.tokens.access_token, usernames: usernames)
     }
 }
 
