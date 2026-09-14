@@ -6,7 +6,8 @@ api_key_upstream_base_url: "https://api.openai.com/v1"
 request_timeout_seconds: 300
 
 # Explicit ports required; http CONNECT, https CONNECT and socks5 supported.
-# Proxy authentication is deliberately unsupported (same as Copool).
+# Optional authentication: scheme://username:password@host:port.
+# Percent-encode reserved characters in credentials.
 # Set any route's proxy to none for explicit direct access; aliases can also map to none.
 proxies:
   us: "http://127.0.0.1:8101"

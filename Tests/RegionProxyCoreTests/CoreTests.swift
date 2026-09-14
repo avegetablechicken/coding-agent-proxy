@@ -125,13 +125,30 @@ final class CoreTests: XCTestCase {
                      yaml + "\nunknown_option: true", yaml + "\nlisten_port: 8888"] {
             XCTAssertThrowsError(try Configuration.parse(text))
         }
-        for proxy in ["", "direct", "http://localhost", "http://user:secret@localhost:8080", "ftp://localhost:8080", "socks5://localhost:0", "http://localhost:8080?q=1"] {
+        for proxy in ["", "direct", "http://localhost", "http://user@localhost:8080", "ftp://localhost:8080", "socks5://localhost:0", "http://localhost:8080?q=1"] {
             XCTAssertThrowsError(try Configuration.proxyConfiguration(proxy))
         }
         XCTAssertFalse(try Configuration.proxyConfiguration("http://localhost:8080").allowFailover)
         XCTAssertFalse(try Configuration.proxyConfiguration("https://localhost:8080").allowFailover)
         XCTAssertFalse(try Configuration.proxyConfiguration("socks5://localhost:8080").allowFailover)
     }
+
+    func testProxyCredentialsAndRedaction() throws {
+        for scheme in ["http", "https", "socks5"] {
+            let endpoint = "\(scheme)://user%40example:p%3Ass%40word@localhost:8080"
+            XCTAssertNoThrow(try Configuration.proxyConfiguration(endpoint))
+            XCTAssertEqual(Configuration.redactedProxyEndpoint(endpoint), "\(scheme)://localhost:8080")
+        }
+        XCTAssertEqual(Configuration.redactedProxyEndpoint("none"), "none")
+        XCTAssertEqual(Configuration.redactedProxyEndpoint("http://u:p@[::1]:8080"), "http://[::1]:8080")
+        XCTAssertNoThrow(try Configuration.proxyConfiguration("http://user:@localhost:8080"))
+        for endpoint in ["http://user@localhost:8080", "http://:password@localhost:8080",
+                         "http://user:bad%0D%0Aheader@localhost:8080", "http://user%3Aname:password@localhost:8080",
+                         "socks5://user:@localhost:8080", "socks5://user:\(String(repeating: "p", count: 256))@localhost:8080"] {
+            XCTAssertThrowsError(try Configuration.proxyConfiguration(endpoint))
+        }
+    }
+
 
     func testAuthSnapshotValidation() throws {
         let identity = try Identity.parse(Data(#"{"tokens":{"account_id":"abc","access_token":"secret"}}"#.utf8))

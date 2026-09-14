@@ -397,6 +397,29 @@ A service used only for public MCP can omit model credential routes; model API
 requests still require configured authentication and routing. Invalid YAML is
 an error for both services, not a reason to use direct access.
 
+## Proxy username/password authentication
+
+Proxy entries retain their string format and may include credentials:
+
+```yaml
+proxies:
+  authenticated_http: "http://proxy-user:proxy-password@proxy.example.com:8080"
+  authenticated_https: "https://proxy-user:proxy-password@proxy.example.com:8443"
+  authenticated_socks: "socks5://proxy-user:proxy-password@proxy.example.com:1080"
+```
+
+The system networking stack supplies the credentials to the proxy, separately
+from the model request's Bearer token. Percent-encode reserved characters in
+usernames/passwords: for example, `user@example` and `p:ss@word` become
+`user%40example:p%3Ass%40word`. Supply both fields; an empty password is accepted
+for HTTP(S), while SOCKS5 requires 1–255 UTF-8 bytes per field. HTTP usernames
+cannot contain a colon. Credentials containing control characters are rejected.
+
+Proxy endpoint logs omit both username and password. Unauthenticated URLs and
+`none` remain supported. Restart the service after changing proxy credentials
+in YAML. An authentication failure does not switch to a different proxy or direct
+access.
+
 ## Multiple proxy services with mihomo and Clash
 
 [mihomo](https://github.com/MetaCubeX/mihomo) is the proxy core used by compatible Clash clients. One core can expose several local proxy services at once, each pinned to a different outbound node. For example:
@@ -542,7 +565,7 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 ## Limits and troubleshooting
 
 - The upstream must use HTTPS and a public service hostname. IP addresses and local hostnames are rejected because URLSession can implicitly bypass proxies for loopback destinations.
-- Proxy URLs require an explicit port and support `http`, `https`, or `socks5`. Proxy credentials in these URLs are unsupported; mihomo can handle remote authentication as shown above.
+- Proxy URLs require an explicit port and support `http`, `https`, or `socks5`. Optional username/password authentication uses `scheme://username:password@host:port`. Logged endpoints omit credentials.
 - Inbound limits: 32 MiB request body, 64 KiB headers, 128 concurrent connections, and a 30-second read timeout. Content-Length and chunked uploads are supported; each connection handles one request.
 - `Expect: 100-continue` returns HTTP 417. WebSocket Upgrade returns HTTP 426.
 - SSE is flushed at line boundaries or 16 KiB; ordinary responses use 16 KiB chunks. URLSession may add its own internal buffering.

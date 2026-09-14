@@ -42,14 +42,14 @@ public actor Forwarder {
                 let identity = try self.identitySource.load(configuration: self.config)
                 let name = try config.proxyName(for: identity)
                 logger?.write("current_route", ["account_id": identity.accountID, "proxy": name,
-                                               "proxy_endpoint": config.proxyEndpoint(for: name)])
+                                               "proxy_endpoint": Configuration.redactedProxyEndpoint(config.proxyEndpoint(for: name))])
             } catch {
                 logger?.write("route_unavailable", ["reason": (error as? ProxyError)?.message ?? "Cannot read current account route."])
             }
         }
         for provider in config.providers {
             var providerFields = ["provider": provider.name, "proxy": provider.proxy,
-                                  "proxy_endpoint": config.proxyEndpoint(for: provider.proxy)]
+                                  "proxy_endpoint": Configuration.redactedProxyEndpoint(config.proxyEndpoint(for: provider.proxy))]
             do {
                 _ = try provider.resolveCredential(defaultUpstream: config.api_key_upstream_base_url)
                 logger?.write("current_route", providerFields)
@@ -208,7 +208,7 @@ public actor Forwarder {
             stage = "routing"
             let proxyURL = config.proxyEndpoint(for: name)
             fields["proxy"] = name
-            fields["proxy_endpoint"] = proxyURL
+            fields["proxy_endpoint"] = Configuration.redactedProxyEndpoint(proxyURL)
             stage = "request"
             if requestPath.hasPrefix("/mcp/"), !docsMCP {
                 status = 404

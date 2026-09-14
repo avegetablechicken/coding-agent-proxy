@@ -137,6 +137,14 @@ public struct Configuration: Decodable, Sendable {
         name == "none" ? "none" : proxies[name]!
     }
 
+    public static func redactedProxyEndpoint(_ value: String) -> String {
+        if value == "none" { return value }
+        guard var url = URLComponents(string: value) else { return "<invalid-proxy>" }
+        url.user = nil
+        url.password = nil
+        return url.string ?? "<invalid-proxy>"
+    }
+
     static func configureTransport(_ configuration: URLSessionConfiguration, endpoint: String) throws {
         if endpoint == "none" {
             configuration.proxyConfigurations = []
@@ -155,9 +163,17 @@ public struct Configuration: Decodable, Sendable {
         guard let url = URLComponents(string: value),
               let scheme = url.scheme, ["http", "https", "socks5"].contains(scheme),
               let host = url.host, !host.isEmpty, let port = url.port, (1...65535).contains(port),
-              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/" else {
-            throw ProxyError("Invalid proxy URL: use http/https/socks5://host:port without credentials.")
+            throw ProxyError("Invalid proxy URL: use http/https/socks5://[username:password@]host:port.")
+        }
+        if url.user != nil || url.password != nil {
+            guard let username = url.user, !username.isEmpty, let password = url.password,
+                  (username + password).unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }),
+                  scheme == "socks5" || !username.contains(":"),
+                  scheme != "socks5" || ((1...255).contains(username.utf8.count) && (1...255).contains(password.utf8.count)) else {
+                throw ProxyError("Invalid proxy credentials: supply username and password without control characters; SOCKS5 fields must be 1–255 UTF-8 bytes and HTTP usernames cannot contain a colon.")
+            }
         }
         let endpoint = NWEndpoint.hostPort(host: .init(host), port: .init(rawValue: UInt16(port))!)
         var proxy = scheme == "socks5"
@@ -166,6 +182,9 @@ public struct Configuration: Decodable, Sendable {
         proxy.allowFailover = false
         proxy.matchDomains = [""]
         proxy.excludedDomains = []
+        if let username = url.user, let password = url.password {
+            proxy.applyCredential(username: username, password: password)
+        }
         return proxy
     }
 
