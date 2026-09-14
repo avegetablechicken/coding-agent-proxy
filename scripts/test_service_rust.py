@@ -27,6 +27,7 @@ class RustServiceTests(unittest.TestCase):
         unit = service.systemd_unit(path)
         self.assertIn('100%% \\"quoted\\"', unit)
         self.assertIn('WorkingDirectory=/home/test user/100%% "quoted"/proxy/\n', unit)
+        self.assertIn('EnvironmentFile=-/home/test user/100%% "quoted"/proxy/service.env\n', unit)
         self.assertIn("Restart=on-failure", unit)
         self.assertNotIn("python", unit)
         plist = plistlib.loads(service.launchd_plist(path))

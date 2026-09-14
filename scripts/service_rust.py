@@ -89,7 +89,7 @@ def systemd_unit(runtime):
             "[Service]\nType=simple\n"
             f"WorkingDirectory={working_directory}/\n"
             f"ExecStart={' '.join(systemd_quote(x, command=True) for x in args)}\n"
-            f"EnvironmentFile=-{systemd_quote(runtime / 'service.env')}\n"
+            f"EnvironmentFile=-{working_directory}/service.env\n"
             "Restart=on-failure\nRestartSec=10\nUMask=0077\nTimeoutStopSec=10\n\n"
             "[Install]\nWantedBy=default.target\n")
 

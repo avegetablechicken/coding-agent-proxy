@@ -53,6 +53,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="coding-proxy-systemd-") as directory:
         folder = Path(directory)
         runtime = folder / "runtime with spaces"
+        runtime.mkdir(mode=0o700)
+        (runtime / "service.env").write_text("CODING_PROXY_SYSTEMD_TEST_VALUE=loaded\n")
+        (runtime / "service.env").chmod(0o600)
         service.runtime_dir = lambda: runtime
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -66,6 +69,7 @@ def main():
             before = subprocess.check_output(
                 ["systemctl", "--user", "show", unit, "-p", "MainPID", "--value"], text=True).strip()
             assert before != "0"
+            assert b"CODING_PROXY_SYSTEMD_TEST_VALUE=loaded" in Path(f"/proc/{before}/environ").read_bytes().split(b"\0")
             preserved = (runtime / "config.yaml").read_bytes()
             config.write_text("invalid checkout settings\n")
             assert service.manage("update", binary, config) == 0
