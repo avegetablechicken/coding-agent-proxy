@@ -3,6 +3,39 @@ import XCTest
 @testable import RegionProxyCore
 
 final class APIKeyTests: XCTestCase {
+    func testBuiltInOpenAIUsesServiceDefaultInsteadOfCodexModelURL() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try """
+        openai_base_url = "http://127.0.0.1:7889/v1"
+        [model_providers.vendor]
+        env_key = "VENDOR_KEY"
+        base_url = "http://127.0.0.1:7889/https://vendor.example.com/v1"
+        """.write(to: folder.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+        let environment = ["CODEX_HOME": folder.path, "OPENAI_API_KEY": "test-key", "ALT_KEY": "alternate", "VENDOR_KEY": "vendor-key"]
+        for (fields, expected) in [
+            ("name: openai", "https://default.example.com/v1"),
+            ("api_key_env: OPENAI_API_KEY", "https://default.example.com/v1"),
+            ("name: openai\n      api_key_env: ALT_KEY", "https://default.example.com/v1"),
+            ("name: openai\n      upstream_base_url: https://override.example.com/v1", "https://override.example.com/v1"),
+            ("name: vendor", "https://vendor.example.com/v1")
+        ] {
+            let config = try Configuration.parse("""
+            listen_port: 7889
+            request_timeout_seconds: 30
+            base_url:
+              api_key: https://default.example.com/v1
+            routing:
+              api_key:
+                - \(fields)
+                  proxy: none
+            """)
+            let provider = try XCTUnwrap(config.providers.first)
+            XCTAssertEqual(try provider.resolveCredential(environment: environment, defaultUpstream: config.api_key_upstream_base_url).upstream, expected)
+        }
+    }
+
     func testTopLevelAPIKeyDefaultAndFallback() throws {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: file) }

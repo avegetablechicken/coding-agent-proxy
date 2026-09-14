@@ -33,7 +33,6 @@ routing:
   api_key:
     - name: openai
       api_key_env: OPENAI_API_KEY
-      upstream_base_url: "https://api.openai.com/v1"
       proxy: us
   # account_fallback: jp
   # api_key_fallback: us
@@ -64,9 +63,10 @@ uses `OPENAI_API_KEY`. An explicit `api_key_env` overrides the variable name.
 Without `name`, `api_key_env` can reverse-match a Codex provider. Ambiguous matches
 are rejected. File-backed entries do not depend on Codex provider metadata.
 
-An entry's explicit `upstream_base_url` takes priority, followed by its Codex
-provider URL and then `base_url.api_key`. For the built-in OpenAI provider, set
-an explicit upstream if Codex's `openai_base_url` points at this local service.
+An entry's explicit `upstream_base_url` always takes priority. The built-in
+`openai` provider otherwise uses `base_url.api_key`, independently of Codex's
+`openai_base_url`. Custom providers use their Codex `base_url` when present,
+then fall back to `base_url.api_key`.
 All upstreams must be HTTPS public hostnames. API Keys are not converted into
 ChatGPT login credentials, and ChatGPT tokens are not converted into API Keys.
 

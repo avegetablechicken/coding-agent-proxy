@@ -401,7 +401,10 @@ public struct APIKeyProvider: Codable, Sendable {
         }
         let raw = try environment[variable] ?? ShellEnvironment.value(for: variable, environment: environment)
         let key = try Self.validatedKey(raw)
-        let upstream = try Configuration.unwrappedUpstream(upstream_base_url ?? definition?.base_url ?? defaultUpstream)
+        // Codex's built-in model URL may point back at this listener. Its API
+        // route uses our API default instead; custom providers retain their URL.
+        let providerUpstream = definition?.id == "openai" ? nil : definition?.base_url
+        let upstream = try Configuration.unwrappedUpstream(upstream_base_url ?? providerUpstream ?? defaultUpstream)
         return (key, upstream)
     }
 
