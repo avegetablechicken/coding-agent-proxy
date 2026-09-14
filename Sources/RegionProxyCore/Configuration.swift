@@ -209,7 +209,7 @@ public struct Configuration: Decodable, Sendable {
         }
         for provider in providers {
             do {
-                let credential = try provider.resolveCredential(defaultUpstream: api_key_upstream_base_url)
+                let credential = try provider.resolveCredential(defaultUpstream: api_key_upstream_base_url, allowShellLookup: matchedIdentity == nil)
                 let key = credential.key
                 if token == key {
                     matches.append(CredentialRoute(token: key, accountID: nil, provider: provider.name,
@@ -304,7 +304,7 @@ public struct APIKeyProvider: Decodable, Sendable {
     }
 
     public func resolveCredential(environment: [String: String] = ProcessInfo.processInfo.environment,
-                                  defaultUpstream: String = "https://api.openai.com/v1") throws -> (key: String, upstream: String) {
+                                  defaultUpstream: String = "https://api.openai.com/v1", allowShellLookup: Bool = true) throws -> (key: String, upstream: String) {
         // File-backed routes retain their explicit label and do not require Codex config.
         if let file = api_key_file {
             guard let raw = try? String(contentsOfFile: NSString(string: file).expandingTildeInPath, encoding: .utf8) else {
@@ -331,10 +331,13 @@ public struct APIKeyProvider: Decodable, Sendable {
             reversed = candidates.first
         }
         let definition = named ?? reversed
-        guard let variable = api_key_env ?? definition?.env_key,
-              let raw = environment[variable] else {
+        guard let variable = api_key_env ?? definition?.env_key else {
             throw ProxyError("API Key environment variable is unavailable.")
         }
+        guard environment[variable] != nil || allowShellLookup else {
+            throw ProxyError("API Key environment variable is unavailable.")
+        }
+        let raw = try environment[variable] ?? ShellEnvironment.value(for: variable, environment: environment)
         let key = try Self.validatedKey(raw)
         let upstream = try Configuration.unwrappedUpstream(upstream_base_url ?? definition?.base_url ?? defaultUpstream)
         return (key, upstream)

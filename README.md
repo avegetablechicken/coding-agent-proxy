@@ -597,3 +597,10 @@ Swift tests cover configuration, identity validation, path mapping, HTTP framing
 Special thanks to **[Copool](https://github.com/AlickH/Copool)** and its contributors. Copool's local proxy implementation informed the technology choices here: Swift 6, Network.framework (`NWListener` / `NWConnection`), `URLSession.AsyncBytes`, and per-session `ProxyConfiguration`. This project's HTTP parsing and account routing are implemented separately; it does not include Copool's account pool, account rotation, quota management, model mapping, or protocol conversion features.
 
 Thanks also to [Yams](https://github.com/jpsim/Yams) for YAML parsing and [mihomo](https://github.com/MetaCubeX/mihomo) for the proxy core used in the multi-listener setup.
+
+## Runtime shell API keys
+
+When the service environment lacks a configured API Key variable, read that exported
+variable using the user's login/interactive zsh, bash or sh. Process variables take
+priority. Lookup is limited to 3 seconds and startup output is discarded.
+Already matched ChatGPT requests do not launch a shell for unrelated API keys.
