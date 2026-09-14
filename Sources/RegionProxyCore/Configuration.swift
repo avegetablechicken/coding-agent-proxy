@@ -119,7 +119,9 @@ public struct Configuration: Decodable, Sendable {
         }
         let accountBase = account_upstream_base_url.hasSuffix("/backend-api/codex")
             ? String(account_upstream_base_url.dropLast("/codex".count)) : account_upstream_base_url
-        return try YAMLEncoder().encode(Output(listen_port: listen_port, auth_file: auth_file.isEmpty ? nil : auth_file,
+        let encoder = YAMLEncoder()
+        encoder.options.sequenceStyle = .flow
+        return try encoder.encode(Output(listen_port: listen_port, auth_file: auth_file.isEmpty ? nil : auth_file,
             account_auth_file_only: account_auth_file_only,
             request_timeout_seconds: request_timeout_seconds,
             base_url: BaseURLs(account: accountBase, api_key: api_key_upstream_base_url), proxies: proxies,
