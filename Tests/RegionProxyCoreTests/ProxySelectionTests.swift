@@ -49,9 +49,7 @@ final class ProxySelectionTests: XCTestCase {
           account:
             account-id: [first, second]
           api_key:
-            - name: vendor
-              proxy: [second, none]
-              api_key_file: /unused/key
+            vendor: [second, none]
           account_fallback: [second, first]
           api_key_fallback: [first, none]
           mcp_fallback: [second]

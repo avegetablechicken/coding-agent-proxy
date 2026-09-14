@@ -26,10 +26,9 @@ final class APIKeyTests: XCTestCase {
             request_timeout_seconds: 30
             base_url:
               api_key: https://default.example.com/v1
-            routing:
-              api_key:
-                - \(fields)
-                  proxy: none
+            api_key_providers:
+              - \(fields.replacingOccurrences(of: "\n      ", with: "\n    "))
+                proxy: none
             """)
             let provider = try XCTUnwrap(config.providers.first)
             XCTAssertEqual(try provider.resolveCredential(environment: environment, defaultUpstream: config.api_key_upstream_base_url).upstream, expected)

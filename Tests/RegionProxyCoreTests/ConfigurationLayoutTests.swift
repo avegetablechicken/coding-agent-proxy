@@ -44,29 +44,23 @@ final class ConfigurationLayoutTests: XCTestCase {
     }
 
     func testNestedAPIKeyRouteAndMigration() throws {
-        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try "test-key".write(to: file, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: file) }
-        let config = try Configuration.parse(yaml + """
-
-          api_key:
-            - name: vendor
-              proxy: us
-              upstream_base_url: https://vendor.example.com/v1
-              api_key_file: '\(file.path)'
-        """)
-        let route = try config.resolveRoute(authorization: "Bearer test-key", loadIdentity: {
-            Identity(accountID: "unmapped", accessToken: "account-token")
-        })
-        XCTAssertEqual(route.proxy, "us")
-        XCTAssertEqual(route.upstream, "https://vendor.example.com/v1")
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try "[model_providers.vendor]\nenv_key = 'VENDOR_KEY'\nbase_url = 'https://vendor.example.com/v1'\n"
+            .write(to: folder.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+        let config = try Configuration.parse(yaml + "\n  api_key:\n    vendor: us\n")
+        let provider = try XCTUnwrap(config.providers.first)
+        let credential = try provider.resolveCredential(environment: ["CODEX_HOME": folder.path, "VENDOR_KEY": "test-key"])
+        XCTAssertEqual(provider.proxy, "us")
+        XCTAssertEqual(credential.upstream, "https://vendor.example.com/v1")
         let encoded = try config.canonicalYAML()
         let decoded = try Configuration.parse(encoded)
         XCTAssertEqual(decoded.accounts, config.accounts)
         XCTAssertEqual(decoded.account_fallback_proxy, "us")
         XCTAssertEqual(decoded.openai_fallback_proxy, "jp")
         XCTAssertEqual(decoded.mcp_fallback_proxy, "none")
-        XCTAssertEqual(decoded.providers.first?.api_key_file, file.path)
+        XCTAssertEqual(decoded.providers.first?.name, "vendor")
         XCTAssertFalse(encoded.contains("test-key"))
         let legacy = try Configuration.parse("listen_port: 7889\nrequest_timeout_seconds: 30\nupstream_base_url: https://chatgpt.com/backend-api/codex")
         XCTAssertEqual(try Configuration.parse(legacy.canonicalYAML()).account_upstream_base_url, "https://chatgpt.com/backend-api")

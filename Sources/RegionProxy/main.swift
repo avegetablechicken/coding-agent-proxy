@@ -38,7 +38,7 @@ struct CodingAgentProxy {
         }
         path = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath).standardizedFileURL.path
         do {
-            let config = try Configuration.read(path)
+            let config = try Configuration.read(path, migrateAPIKeyLayout: writeConfigPath != nil)
             if let destination = writeConfigPath {
                 let text = try config.canonicalYAML()
                 _ = try Configuration.parse(text)

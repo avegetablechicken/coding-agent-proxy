@@ -23,18 +23,12 @@ routing:
     "you@example.com": us
     "replace-with-jp-account-id": jp
 
-  # Optional: uses env_key from the named Codex provider (openai -> OPENAI_API_KEY).
-  # Each entry may use api_key_env OR api_key_file. Keys must be distinct.
+  # Keys are Codex provider IDs or environment variable names, not secret values.
+  # Provider IDs are matched first. Unknown variable names use base_url.api_key.
   # api_key:
-  #   - name: openai
-  #     proxy: us
-  #   - name: openai
-  #     api_key_env: SECOND_OPENAI_API_KEY
-  #     proxy: jp
-  #   - name: provider-a
-  #     api_key_file: "~/.config/coding-agent-proxy/provider-a.key"
-  #     upstream_base_url: "https://a.example.com/v1"
-  #     proxy: us
+  #   ShareCoder: none
+  #   OPENAI_API_KEY: us
+  #   SECOND_OPENAI_API_KEY: [jp, us]
 
   # All fallback fields reference proxies above, or none for explicit direct access.
   # Account: only a verified ChatGPT token without an account mapping can use it.
@@ -46,7 +40,7 @@ routing:
 
 # Any routing proxy value also accepts ordered candidates, for example:
 # routing.account.<account-id>: [jp, us]
-# routing.api_key[].proxy: [us, jp]
+# routing.api_key.OPENAI_API_KEY: [us, jp]
 # routing.account_fallback: [jp, us]
 # routing.api_key_fallback: [us, jp, none]
 # routing.mcp_fallback: [jp, none]

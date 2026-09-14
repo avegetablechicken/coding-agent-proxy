@@ -31,9 +31,8 @@ routing:
   account:
     "you@example.com": jp
   api_key:
-    - name: openai
-      api_key_env: OPENAI_API_KEY
-      proxy: us
+    OPENAI_API_KEY: us
+    ShareCoder: none
   # account_fallback: jp
   # api_key_fallback: us
   # mcp_fallback: jp
@@ -77,18 +76,20 @@ Configured API Key routes and API/MCP fallbacks retain their existing behavior.
 `--check` in this mode checks configuration and API Key sources without requiring
 a saved ChatGPT login. Restart the service after changing this setting.
 
-`routing.api_key` is a list so multiple keys can share a provider but select
-different proxies. Each entry has `proxy`, a `name` and/or `api_key_env`, and
-optionally `api_key_file` or `upstream_base_url`. Do not combine `api_key_env`
-and `api_key_file`. `name` selects a Codex provider and its `env_key`; `openai`
-uses `OPENAI_API_KEY`. An explicit `api_key_env` overrides the variable name.
-Without `name`, `api_key_env` can reverse-match a Codex provider. Ambiguous matches
-are rejected. File-backed entries do not depend on Codex provider metadata.
+`routing.api_key` uses the same key-to-proxy mapping as `routing.account`.
+Keys are either exact Codex provider IDs (`ShareCoder: none`) or environment
+variable names (`OPENAI_API_KEY: us`). Values may be a proxy name, `none`, or an
+ordered proxy list. List-of-object entries and nested `name`, `proxy`,
+`api_key_env`, `api_key_file` or `upstream_base_url` fields are not accepted here.
 
-An entry's explicit `upstream_base_url` always takes priority. The built-in
-`openai` provider otherwise uses `base_url.api_key`, independently of Codex's
-`openai_base_url`. Custom providers use their Codex `base_url` when present,
-then fall back to `base_url.api_key`.
+A key first matches a Codex provider ID; its `env_key` identifies the credential.
+Otherwise the key is treated as an environment variable name and may reverse-match
+a provider by `env_key`. Multiple reverse matches are rejected; use the provider ID
+to disambiguate. A variable with no matching provider uses `base_url.api_key`.
+The built-in `openai` provider also uses `base_url.api_key`, independently of
+Codex's `openai_base_url`. Custom provider upstreams come from Codex's provider
+`base_url`, including supported explicit local wrapper URLs. Configure custom
+upstreams in Codex rather than adding fields to this mapping.
 All upstreams must be HTTPS public hostnames. API Keys are not converted into
 ChatGPT login credentials, and ChatGPT tokens are not converted into API Keys.
 
@@ -115,8 +116,7 @@ routing:
   account:
     "account-id": [jp, us]
   api_key:
-    - name: openai
-      proxy: [us, jp]
+    OPENAI_API_KEY: [us, jp]
   account_fallback: [jp, us]
   api_key_fallback: [us, jp, none]
   mcp_fallback: [jp, none]
@@ -141,8 +141,7 @@ candidate again. Logs include a redacted `proxy_probe` event for each attempted
 candidate and the selected proxy in `route_selected`.
 
 YAML is loaded once at startup. Account mappings, upstreams, proxy credentials,
-fallbacks and timeouts require a restart after editing. `auth.json` and API Key
-files are read per request so credential rotation can take effect without restart.
+fallbacks and timeouts require a restart after editing. `auth.json` is read per request so credential rotation can take effect without restart.
 Codex provider configuration lookup retains its existing request-time behavior.
 
 For environment-backed API Keys, process variables take priority. If a variable
@@ -174,7 +173,10 @@ The migration command writes a private file without printing its credentials:
 .build/release/coding-agent-proxy --config config.new.yaml --check
 ```
 
-It preserves proxy URLs and credential sources and normalizes the account base
+It converts old API Key object lists to mapping keys when representable. Entries
+with Key files, per-route upstream overrides or duplicate selectors require manual
+migration into Codex provider/environment configuration; migration refuses to
+silently discard those settings. It preserves proxy URLs and normalizes the account base
 to `/backend-api`. Back up the active config before replacing it, then restart.
 
 ## Connect Codex

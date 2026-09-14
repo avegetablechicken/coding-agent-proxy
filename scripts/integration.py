@@ -303,6 +303,9 @@ proxies:
   us: http://127.0.0.1:{a.server_address[1]}
   jp: http://127.0.0.1:{b.server_address[1]}
 routing:
+  api_key:
+    reverse: us
+    EXTRA_KEY_B: jp
   account_fallback: us
   api_key_fallback: jp
   mcp_fallback: us
@@ -317,6 +320,8 @@ routing:
                 ("fallback-account-token", "/v1/responses", a, "chatgpt-mixed.invalid"),
                 ("fallback-account-token", "/backend-api/ps/plugins/installed", a, "chatgpt-mixed.invalid"),
                 ("unknown-api-token", "/v1/responses", b, "fallback-default.invalid"),
+                ("provider-key-one", "/v1/responses", a, "provider-a.invalid"),
+                ("extra-key-b", "/v1/responses", b, "fallback-default.invalid"),
                 (None, "/mcp/openaiDeveloperDocs", a, "developers.openai.com")
             ]:
                 before = len(probe.requests)

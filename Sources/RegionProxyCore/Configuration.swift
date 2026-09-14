@@ -33,7 +33,7 @@ public struct Configuration: Decodable, Sendable {
 
     private struct Routing: Codable {
         let account: [String: ProxyChoice]?
-        let api_key: [APIKeyProvider]?
+        let api_key: [String: ProxyChoice]?
         let account_fallback: ProxyChoice?
         let api_key_fallback: ProxyChoice?
         let mcp_fallback: ProxyChoice?
@@ -61,17 +61,42 @@ public struct Configuration: Decodable, Sendable {
         request_timeout_seconds = try values.decode(Double.self, forKey: .request_timeout_seconds)
         proxies = try values.decodeIfPresent([String: String].self, forKey: .proxies) ?? [:]
         accounts = try routing?.account ?? values.decodeIfPresent([String: ProxyChoice].self, forKey: .accounts) ?? [:]
-        providers = try routing?.api_key ?? values.decodeIfPresent([APIKeyProvider].self, forKey: .api_key_providers) ?? []
+        if let mapping = routing?.api_key {
+            providers = mapping.keys.sorted().map { APIKeyProvider(selector: $0, proxy: mapping[$0]!) }
+        } else {
+            providers = try values.decodeIfPresent([APIKeyProvider].self, forKey: .api_key_providers) ?? []
+        }
         account_fallback_proxy = routing?.account_fallback
         openai_fallback_proxy = try routing?.api_key_fallback ?? values.decodeIfPresent(ProxyChoice.self, forKey: .openai_fallback_proxy)
         mcp_fallback_proxy = try routing?.mcp_fallback ?? values.decodeIfPresent(ProxyChoice.self, forKey: .mcp_fallback_proxy)
     }
 
-    public static func read(_ path: String) throws -> Configuration {
+    public static func read(_ path: String, migrateAPIKeyLayout: Bool = false) throws -> Configuration {
         let text: String
         do { text = try String(contentsOfFile: path, encoding: .utf8) }
         catch { throw ProxyError("Cannot read configuration file.") }
-        return try parse(text)
+        return try parse(migrateAPIKeyLayout ? migrateAPIKeyMapping(text) : text)
+    }
+
+    private static func migrateAPIKeyMapping(_ text: String) throws -> String {
+        guard var root = try Yams.load(yaml: text) as? [String: Any] else { return text }
+        var routing = root["routing"] as? [String: Any] ?? [:]
+        guard let old = routing["api_key"] as? [[String: Any]] else { return text }
+        var mapping: [String: Any] = [:]
+        for entry in old {
+            guard Set(entry.keys).isSubset(of: ["name", "api_key_env", "proxy"]),
+                  entry["api_key_env"] == nil || entry["name"] == nil || entry["name"] as? String == "openai",
+                  let identifier = (entry["api_key_env"] ?? entry["name"]) as? String,
+                  let proxy = entry["proxy"] else {
+                throw ProxyError("Cannot migrate API Key routes with files, upstream overrides or duplicate keys; define providers in Codex first.")
+            }
+            let key = identifier == "openai" && entry["api_key_env"] == nil ? "OPENAI_API_KEY" : identifier
+            guard mapping[key] == nil else { throw ProxyError("Duplicate API Key mapping after migration.") }
+            mapping[key] = proxy
+        }
+        routing["api_key"] = mapping
+        root["routing"] = routing
+        return try Yams.dump(object: root)
     }
 
     public func canonicalYAML() throws -> String {
@@ -84,13 +109,21 @@ public struct Configuration: Decodable, Sendable {
             let proxies: [String: String]
             let routing: Routing
         }
+        var apiMapping: [String: ProxyChoice] = [:]
+        for provider in providers {
+            guard provider.api_key_file == nil, provider.upstream_base_url == nil,
+                  apiMapping[provider.name] == nil else {
+                throw ProxyError("Cannot encode legacy API Key route as a simple mapping without losing configuration.")
+            }
+            apiMapping[provider.name] = provider.proxy
+        }
         let accountBase = account_upstream_base_url.hasSuffix("/backend-api/codex")
             ? String(account_upstream_base_url.dropLast("/codex".count)) : account_upstream_base_url
         return try YAMLEncoder().encode(Output(listen_port: listen_port, auth_file: auth_file.isEmpty ? nil : auth_file,
             account_auth_file_only: account_auth_file_only,
             request_timeout_seconds: request_timeout_seconds,
             base_url: BaseURLs(account: accountBase, api_key: api_key_upstream_base_url), proxies: proxies,
-            routing: Routing(account: accounts.isEmpty ? nil : accounts, api_key: providers.isEmpty ? nil : providers,
+            routing: Routing(account: accounts.isEmpty ? nil : accounts, api_key: apiMapping.isEmpty ? nil : apiMapping,
                              account_fallback: account_fallback_proxy, api_key_fallback: openai_fallback_proxy,
                              mcp_fallback: mcp_fallback_proxy)))
     }
@@ -340,11 +373,21 @@ public struct Configuration: Decodable, Sendable {
 
 public struct APIKeyProvider: Codable, Sendable {
     public let upstream_base_url: String?
-    public var name: String { providerID ?? api_key_env ?? "" }
+    public let selector: String?
+    public var name: String { selector ?? providerID ?? api_key_env ?? "" }
     public let proxy: ProxyChoice
     public let api_key_env: String?
     public let api_key_file: String?
     public let providerID: String?
+
+    public init(selector: String, proxy: ProxyChoice) {
+        self.selector = selector
+        self.proxy = proxy
+        providerID = nil
+        api_key_env = nil
+        api_key_file = nil
+        upstream_base_url = nil
+    }
 
     enum CodingKeys: String, CodingKey {
         case name, proxy, upstream_base_url, api_key_env, api_key_file
@@ -368,6 +411,7 @@ public struct APIKeyProvider: Codable, Sendable {
               explicitName != nil || explicitEnv != nil else {
             throw ProxyError("Specify a nonempty name or api_key_env.")
         }
+        selector = nil
         providerID = explicitName
         proxy = try values.decode(ProxyChoice.self, forKey: .proxy)
         upstream_base_url = try values.decodeIfPresent(String.self, forKey: .upstream_base_url)
@@ -387,15 +431,17 @@ public struct APIKeyProvider: Codable, Sendable {
             return (try Self.validatedKey(raw), upstream)
         }
         let definitions = try CodexProviderLookup.definitions(environment: environment)
+        let selectedID = providerID ?? selector.flatMap { key in definitions.contains(where: { $0.id == key }) ? key : nil }
+        let selectedEnv = api_key_env ?? (selectedID == nil ? selector : nil)
         let named: CodexProviderLookup.Definition?
-        if let providerID {
-            guard let found = definitions.first(where: { $0.id == providerID }) else {
+        if let selectedID {
+            guard let found = definitions.first(where: { $0.id == selectedID }) else {
                 throw ProxyError("Codex Provider ID has no API Key configuration.")
             }
             named = found
         } else { named = nil }
         var reversed: CodexProviderLookup.Definition?
-        if named == nil, let variable = api_key_env {
+        if named == nil, let variable = selectedEnv {
             let candidates = definitions.filter { $0.env_key == variable }
             guard candidates.count <= 1 else {
                 throw ProxyError("api_key_env matches multiple Codex providers; routing is ambiguous.")
@@ -403,7 +449,7 @@ public struct APIKeyProvider: Codable, Sendable {
             reversed = candidates.first
         }
         let definition = named ?? reversed
-        guard let variable = api_key_env ?? definition?.env_key else {
+        guard let variable = selectedEnv ?? definition?.env_key else {
             throw ProxyError("API Key environment variable is unavailable.")
         }
         guard environment[variable] != nil || allowShellLookup else {
