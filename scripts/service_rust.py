@@ -78,11 +78,16 @@ def systemd_quote(value, command=False):
 
 
 def systemd_unit(runtime):
+    # WorkingDirectory is a literal path, not a shell-like word list. In
+    # systemd 245, surrounding quotes become part of the path and invalidate it.
+    working_directory = str(runtime).replace('%', '%%')
+    if '\n' in working_directory or '\r' in working_directory:
+        raise RuntimeError("The systemd runtime directory cannot contain newlines.")
     binary = runtime / executable("linux")
     args = [binary, "--config", runtime / "config.yaml"]
     return ("[Unit]\nDescription=Coding Agent Proxy (Rust)\nAfter=network.target\n\n"
             "[Service]\nType=simple\n"
-            f"WorkingDirectory={systemd_quote(runtime)}\n"
+            f"WorkingDirectory={working_directory}/\n"
             f"ExecStart={' '.join(systemd_quote(x, command=True) for x in args)}\n"
             f"EnvironmentFile=-{systemd_quote(runtime / 'service.env')}\n"
             "Restart=on-failure\nRestartSec=10\nUMask=0077\nTimeoutStopSec=10\n\n"
@@ -184,7 +189,12 @@ def manage(action, source, config):
             subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
             subprocess.run(["systemctl", "--user", "enable", "--now", unit], check=True)
         elif action == "uninstall":
-            subprocess.run(["systemctl", "--user", "disable", "--now", unit], check=True)
+            # A malformed unit can be registered but not loaded. Still remove
+            # its registration; do not mask other stop failures.
+            stopped = subprocess.run(["systemctl", "--user", "stop", unit])
+            if stopped.returncode not in (0, 5):
+                stopped.check_returncode()
+            subprocess.run(["systemctl", "--user", "disable", unit], check=True)
             registration.unlink(missing_ok=True)
             subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
         else:

@@ -1,5 +1,5 @@
 import plistlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -23,9 +23,10 @@ class RustServiceTests(unittest.TestCase):
             self.assertEqual((runtime / "coding-agent-proxy").read_bytes(), b"new executable")
 
     def test_registration_escapes_paths_and_uses_native_binary(self):
-        path = Path('/home/test user/100% "quoted"/proxy')
+        path = PurePosixPath('/home/test user/100% "quoted"/proxy')
         unit = service.systemd_unit(path)
         self.assertIn('100%% \\"quoted\\"', unit)
+        self.assertIn('WorkingDirectory=/home/test user/100%% "quoted"/proxy/\n', unit)
         self.assertIn("Restart=on-failure", unit)
         self.assertNotIn("python", unit)
         plist = plistlib.loads(service.launchd_plist(path))
@@ -36,6 +37,21 @@ class RustServiceTests(unittest.TestCase):
         self.assertIn("-LogonType Interactive -RunLevel Limited", script)
         self.assertIn("coding-agent-proxy.exe", script)
         self.assertIn("[TimeSpan]::Zero", script)
+
+    def test_uninstall_removes_registered_but_unloaded_linux_unit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            unit = home / ".config/systemd/user" / f"{service.LABEL}.service"
+            unit.parent.mkdir(parents=True)
+            unit.write_text("invalid unit")
+            def run(command, **kwargs):
+                return service.subprocess.CompletedProcess(command, 5 if "stop" in command else 0)
+            with patch.object(service.sys, "platform", "linux"), patch.object(Path, "home", return_value=home), \
+                 patch.dict(service.os.environ, {"XDG_CONFIG_HOME": str(home / ".config")}), \
+                 patch.object(service, "runtime_dir", return_value=home / "runtime"), \
+                 patch.object(service.subprocess, "run", side_effect=run):
+                self.assertEqual(service.manage("uninstall", home / "binary", home / "config"), 0)
+                self.assertFalse(unit.exists())
 
     def test_linux_update_does_not_call_systemctl(self):
         with tempfile.TemporaryDirectory() as temp:

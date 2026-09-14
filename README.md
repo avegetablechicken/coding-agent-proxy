@@ -20,9 +20,10 @@ cp config.example.yaml config.yaml
 On Windows PowerShell, use `Copy-Item config.example.yaml config.yaml` and
 `./target/release/coding-agent-proxy.exe` in place of the Unix executable path.
 
-The implementation and offline tests have been run on macOS. CI is configured to
-build, test, and package native binaries on macOS, Linux, and Windows; a platform
-is not considered verified until its CI job passes.
+The release build and offline tests have been verified on macOS and Ubuntu
+20.04 x86_64, including Rust 1.85.1 on Ubuntu. Windows still requires native
+verification. CI builds, tests, and packages binaries for all three platforms
+and separately checks the minimum Rust version.
 
 ```yaml
 listen_port: 7889
@@ -257,8 +258,9 @@ the native executable directly, without a Python supervisor:
 The Windows task runs in the logged-in user's session; it is not a system service
 that runs before login. Linux requires an available systemd user manager. On all
 platforms, manage mihomo/Clash separately; the Rust service manager does not start
-an external proxy core. Native registration on Linux and Windows still needs
-validation on those operating systems.
+an external proxy core. The complete Linux service lifecycle has been verified
+on Ubuntu 20.04 with systemd 245. Windows task registration still needs native
+verification.
 
 The service/task name is `local.coding-agent-proxy.rust`. Stop any existing
 listener on the configured port before installing. The script manages only its
@@ -485,6 +487,17 @@ MCP credential isolation. Python integration tests cover account/API Key routing
 credential refresh, configuration snapshots, migration, fallback refusal and
 HTTP/SOCKS5 authentication. They do not call a real model. CI runs these checks
 and builds release binaries for all three operating systems.
+
+On Linux with a working systemd user session, also run:
+
+```sh
+cargo build --locked --release
+python3 scripts/test_systemd.py
+```
+
+This test uses a temporary runtime directory, a unique service name, and an
+ephemeral loopback port. It verifies installation, configuration-preserving
+updates, restart, stop, and uninstall without changing the normal service.
 
 The Python transport tests default to `target/debug/coding-agent-proxy` (with
 `.exe` on Windows). Set `CODING_AGENT_PROXY_BINARY` to test another build, such as
