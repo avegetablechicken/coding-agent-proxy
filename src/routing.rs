@@ -11,8 +11,34 @@ pub struct Route {
     pub provider: Option<String>,
     pub proxy: Choice,
     pub upstream: String,
+    pub custom_upstream: bool,
+}
+pub fn codex_target(target: &str) -> &str {
+    target
+        .strip_prefix("/codex")
+        .filter(|rest| rest.starts_with("/https://"))
+        .unwrap_or(target)
 }
 impl Config {
+    pub fn resolve_url(&self, authorization: Option<&str>, target: &str) -> Result<Option<Route>> {
+        let Some((base, proxy)) =
+            crate::url_routing::match_route(&self.routing.api_key, codex_target(target))?
+        else {
+            return Ok(None);
+        };
+        let token = authorization
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .filter(|s| valid_token(s))
+            .ok_or(Error::new(401, "An API Bearer token is required."))?;
+        Ok(Some(Route {
+            token: token.into(),
+            account_id: None,
+            provider: Some(base.into()),
+            proxy: proxy.clone(),
+            upstream: crate::url_routing::validate_upstream(base)?.into(),
+            custom_upstream: true,
+        }))
+    }
     pub async fn resolve(&self, authorization: Option<&str>, fallback: bool) -> Result<Route> {
         let token = authorization
             .and_then(|s| s.strip_prefix("Bearer "))
@@ -45,6 +71,7 @@ impl Config {
                     provider: Some(p.label().into()),
                     proxy: p.proxy.clone(),
                     upstream,
+                    custom_upstream: false,
                 }),
                 Ok(_) => {}
                 Err(_) => unavailable = true,
@@ -64,6 +91,7 @@ impl Config {
                 provider: None,
                 proxy,
                 upstream: self.base_url.account.clone(),
+                custom_upstream: false,
             });
         }
         if let Some(r) = matches.pop() {
@@ -77,6 +105,7 @@ impl Config {
                     provider: Some("openai-fallback".into()),
                     proxy: proxy.clone(),
                     upstream: self.base_url.api_key.clone(),
+                    custom_upstream: false,
                 });
             }
         }
@@ -196,6 +225,41 @@ pub fn query_url(base: &str, target: &str) -> Result<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn explicit_url_routes_need_auth_but_no_local_key_source_or_fallback() {
+        let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\nrouting:\n  api_key:\n    'api.invalid/v1': none\n").unwrap();
+        config.check_credentials().await.unwrap();
+        assert!(config.providers.is_empty());
+        for target in [
+            "/https://api.invalid/v1/responses",
+            "/codex/https://api.invalid/v1/responses",
+        ] {
+            let route = config
+                .resolve_url(Some("Bearer supplied-key"), target)
+                .unwrap()
+                .unwrap();
+            assert!(route.custom_upstream);
+            assert_eq!(route.proxy.label(), "none");
+            assert_eq!(route.upstream, "https://api.invalid/v1");
+            assert!(route.account_id.is_none());
+            assert_eq!(config.resolve_url(None, target).err().unwrap().status, 401);
+        }
+        assert!(
+            config
+                .resolve_url(Some("Bearer key"), "/https://other.invalid/v1/responses")
+                .unwrap()
+                .is_none()
+        );
+        let text = config.canonical_yaml().unwrap();
+        assert!(text.contains("api.invalid/v1"));
+        assert!(
+            Config::parse(&text)
+                .unwrap()
+                .resolve_url(Some("Bearer key"), "/https://api.invalid/v1/responses")
+                .unwrap()
+                .is_some()
+        );
+    }
     #[test]
     fn paths_and_origin_boundaries() {
         let b = "https://chatgpt.com/backend-api/codex";

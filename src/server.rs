@@ -38,12 +38,17 @@ impl Server {
             clients: Mutex::new(HashMap::new()),
         }
     }
-    fn client(&self, endpoint: &str) -> Result<reqwest::Client> {
+    fn client_transport(&self, endpoint: &str, native_tls: bool) -> Result<reqwest::Client> {
+        let key = if native_tls {
+            format!("native-tls:{endpoint}")
+        } else {
+            endpoint.into()
+        };
         let mut clients = self
             .clients
             .lock()
             .map_err(|_| Error::config("Transport unavailable."))?;
-        if let Some(c) = clients.get(endpoint) {
+        if let Some(c) = clients.get(&key) {
             return Ok(c.clone());
         }
         let mut builder = reqwest::Client::builder()
@@ -53,6 +58,14 @@ impl Server {
             .timeout(Duration::from_secs_f64(self.config.request_timeout_seconds))
             .connect_timeout(Duration::from_secs_f64(self.config.request_timeout_seconds))
             .pool_max_idle_per_host(8);
+        // Explicit API gateways can use certificates accepted by Node/OpenSSL
+        // but rejected by rustls (e.g. self-signed CA certificates as leaves).
+        // Both backends retain chain and hostname/IP verification.
+        builder = if native_tls {
+            builder.use_native_tls()
+        } else {
+            builder.use_rustls_tls()
+        };
         if endpoint != "none" {
             // Remote DNS keeps destination resolution inside the selected SOCKS tunnel.
             let proxy = if let Some(rest) = endpoint.strip_prefix("socks5://") {
@@ -71,14 +84,15 @@ impl Server {
         if clients.len() >= 32 {
             clients.clear();
         }
-        clients.insert(endpoint.into(), client.clone());
+        clients.insert(key, client.clone());
         Ok(client)
     }
-    async fn select(
+    async fn select_transport(
         &self,
         choice: &Choice,
         destination: &Url,
         log: &mut RequestLog,
+        native_tls: bool,
     ) -> Result<String> {
         if let Choice::One(n) = choice {
             return Ok(n.clone());
@@ -90,7 +104,7 @@ impl Server {
         for name in choice.names() {
             let endpoint = self.config.endpoint(name);
             let available = match self
-                .client(endpoint)?
+                .client_transport(endpoint, native_tls)?
                 .head(origin.clone())
                 .timeout(Duration::from_secs_f64(
                     self.config.request_timeout_seconds.min(5.0),
@@ -253,6 +267,7 @@ impl Server {
                 "Only origin-form HTTP request targets are supported.",
             ));
         }
+        let target = crate::routing::codex_target(target);
         let path = target.split('?').next().unwrap_or("");
         let docs = path == MCP_PATH;
         let query = account_query(target);
@@ -280,7 +295,10 @@ impl Server {
                 ),
             }
         } else {
-            let r = self.config.resolve(auth, true).await?;
+            let r = match self.config.resolve_url(auth, target)? {
+                Some(route) => route,
+                None => self.config.resolve(auth, true).await?,
+            };
             if r.account_id.is_some() && account.is_some() && account != r.account_id.as_deref() {
                 return Err(Error::new(
                     409,
@@ -351,7 +369,10 @@ impl Server {
             }
         })?
         .to_bytes();
-        let selected = self.select(&choice, &url, log).await?;
+        let native_tls = route.as_ref().is_some_and(|r| r.custom_upstream);
+        let selected = self
+            .select_transport(&choice, &url, log, native_tls)
+            .await?;
         let endpoint = self.config.endpoint(&selected);
         log.field("proxy", selected);
         log.field("proxy_endpoint", redacted_endpoint(endpoint));
@@ -391,7 +412,7 @@ impl Server {
             }
         }
         headers.insert("accept-encoding", "identity".parse().unwrap());
-        self.client(endpoint)?
+        self.client_transport(endpoint, native_tls)?
             .request(parts.method, url)
             .headers(headers)
             .body(bytes)

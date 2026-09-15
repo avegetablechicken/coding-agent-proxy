@@ -131,29 +131,87 @@ async fn running(config: &str) -> Running {
     }
 }
 use futures_util::FutureExt;
-fn trust(running: &Running, fixture: &Fixture, endpoint: &str) {
-    let mut client = reqwest::Client::builder()
-        .no_proxy()
-        .retry(reqwest::retry::never())
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(3))
-        .add_root_certificate(fixture.certificate.clone());
-    if endpoint == "none" {
-        client = client
-            .resolve("upstream.invalid", fixture.addr)
-            .resolve("developers.openai.com", fixture.addr);
-    } else {
-        client = client.proxy(reqwest::Proxy::all(endpoint).unwrap());
+
+#[tokio::test]
+async fn codex_url_routes_stream_through_declared_transport_without_credential_lookup() {
+    for mode in ["direct", "http"] {
+        let mut fixture = fixture(mode, "sse").await;
+        let endpoint = if mode == "direct" {
+            "none".into()
+        } else {
+            format!("http://127.0.0.1:{}", fixture.addr.port())
+        };
+        let running = running(&format!("proxies:\n  selected: {endpoint}\nrouting:\n  api_key:\n    'upstream.invalid/v1': selected\n")).await;
+        trust(&running, &fixture, &endpoint);
+        let mut response = http()
+            .post(format!(
+                "{}/codex/https://upstream.invalid/v1/responses?stream=true",
+                running.url
+            ))
+            .bearer_auth("url-route-secret")
+            .header("cookie", "private-cookie")
+            .body("model-body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        if mode != "direct" {
+            let connect = fixture.requests.recv().await.unwrap();
+            assert!(connect.starts_with("CONNECT upstream.invalid:443"));
+            assert!(!connect.contains("url-route-secret"));
+        }
+        let request = fixture.requests.recv().await.unwrap();
+        assert!(request.starts_with("POST /v1/responses?stream=true HTTP/1.1"));
+        assert!(request.contains("authorization: Bearer url-route-secret"));
+        assert!(!request.contains("private-cookie"));
+        assert!(request.ends_with("model-body"));
+        assert_eq!(response.chunk().await.unwrap().unwrap(), "data: first\n\n");
+        fixture.release.notify_one();
+        assert_eq!(response.text().await.unwrap(), "data: last\n\n");
+        assert!(fixture.requests.try_recv().is_err());
+        let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+        assert!(!log.contains("url-route-secret"));
     }
-    running
-        .server
-        .clients
-        .lock()
-        .unwrap()
-        .insert(endpoint.into(), client.build().unwrap());
+}
+fn trust(running: &Running, fixture: &Fixture, endpoint: &str) {
+    for native_tls in [false, true] {
+        let mut client = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(3))
+            .add_root_certificate(fixture.certificate.clone());
+        client = if native_tls {
+            client.use_native_tls()
+        } else {
+            client.use_rustls_tls()
+        };
+        if endpoint == "none" {
+            client = client
+                .resolve("upstream.invalid", fixture.addr)
+                .resolve("developers.openai.com", fixture.addr);
+        } else {
+            client = client.proxy(reqwest::Proxy::all(endpoint).unwrap());
+        }
+        let key = if native_tls {
+            format!("native-tls:{endpoint}")
+        } else {
+            endpoint.into()
+        };
+        running
+            .server
+            .clients
+            .lock()
+            .unwrap()
+            .insert(key, client.build().unwrap());
+    }
 }
 fn http() -> reqwest::Client {
-    reqwest::Client::builder().no_proxy().build().unwrap()
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
 }
 
 #[tokio::test]

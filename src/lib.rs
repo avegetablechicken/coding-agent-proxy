@@ -3,6 +3,7 @@ pub mod identity;
 pub mod logger;
 pub mod routing;
 pub mod server;
+pub mod url_routing;
 
 #[derive(Debug, Clone)]
 pub struct Error {

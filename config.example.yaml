@@ -29,6 +29,11 @@ routing:
   #   ShareCoder: none
   #   OPENAI_API_KEY: us
   #   SECOND_OPENAI_API_KEY: [jp, us]
+  # URL routes may omit https:// and /v1; the longest matching path wins.
+  # A supplied Bearer token is required, but no local credential source:
+  #   "provider.example.com/v1": [jp, us]
+  #   "182.92.106.196:6060": none
+  # Client base: http://127.0.0.1:8787/codex/https://provider.example.com/v1
 
   # All fallback fields reference proxies above, or none for explicit direct access.
   # Account: only a verified ChatGPT token without an account mapping can use it.

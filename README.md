@@ -88,7 +88,7 @@ Configured API Key routes and API/MCP fallbacks retain their existing behavior.
 a saved ChatGPT login. Restart the service after changing this setting.
 
 `routing.api_key` uses the same key-to-proxy mapping as `routing.account`.
-Keys are either exact Codex provider IDs (`ShareCoder: none`) or environment
+Credential selectors are either exact Codex provider IDs (`ShareCoder: none`) or environment
 variable names (`OPENAI_API_KEY: us`). Values may be a proxy name, `none`, or an
 ordered proxy list. List-of-object entries and nested `name`, `proxy`,
 `api_key_env`, `api_key_file` or `upstream_base_url` fields are not accepted here.
@@ -218,8 +218,52 @@ GET and a matched ChatGPT login; API Keys cannot read subscription limits.
 The explicit upstream URL form also works, for example:
 `http://127.0.0.1:7889/https://chatgpt.com/backend-api/codex/responses` or
 `http://127.0.0.1:7889/https://provider.example.com/v1/responses`.
-The HTTPS origin and API path must match the credential's configured upstream.
+The HTTPS origin and API path must match the credential's configured upstream
+or an explicitly declared URL route (below).
 There is no arbitrary unauthenticated URL forwarding or `?base_url=` parameter.
+
+### Route API requests by upstream URL
+
+`routing.api_key` also accepts explicit HTTPS upstream bases as keys:
+
+```yaml
+routing:
+  api_key:
+    "provider.example.com": [jp, us]
+    "provider.example.com/v1": jp
+    "182.92.106.196:6060": none
+```
+
+The scheme and API path are optional in routing keys. `api.example.com`
+defaults to HTTPS and matches every path on that host and port;
+`api.example.com/v1` is more specific and wins for `/v1` and `/v1/...`, but not
+`/v1-other`. Requests retain their original path. Ports still match exactly
+(omitted means 443). `//api.example.com/v1` is also accepted. Equivalent full and
+scheme-less keys cannot both be configured. Keys containing a dot, colon or
+slash are URL selectors; ordinary provider IDs and environment variable names
+remain credential selectors.
+
+Set the client base URL to `http://127.0.0.1:7889/https://provider.example.com/v1`
+or `http://127.0.0.1:7889/codex/https://provider.example.com/v1`.
+A declared URL route selects its proxy before provider/environment credential
+lookup. A nonempty Bearer token is still required and is validated by the
+upstream. No local key source or fallback is needed. Requests retain their
+path, query, body and streaming responses. Unmatched URLs retain the existing
+credential-based routing rules; there is no arbitrary unauthenticated forwarding.
+
+Matching checks scheme, host, port and API path boundaries; the longest matching
+base wins. Equivalent duplicate URL bases are rejected. Declared API URL routes
+may use public IPv4 addresses; private, loopback and link-local IPs remain rejected.
+Migration preserves URL keys, and `--check` does not treat them as environment
+variable names. Proxy lists use the existing credential-free probes and never
+replay payloads after an upstream error.
+
+Explicit API routes use native TLS for compatibility with common API gateways;
+normal routes retain rustls. Both verify certificates and hostname/IP identity.
+Linux builds vendor OpenSSL and require a C compiler, make and Perl, but no
+system libssl runtime. For a custom CA on Linux, set the service's `SSL_CERT_FILE`
+to a bundle containing the system CAs and the additional certificate, then restart.
+Other platforms use their native certificate stores. TLS verification stays enabled.
 
 ### OpenAI documentation MCP
 

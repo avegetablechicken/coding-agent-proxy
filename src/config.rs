@@ -150,6 +150,7 @@ impl Config {
             routing
                 .api_key
                 .iter()
+                .filter(|(key, _)| !crate::url_routing::is_url_selector(key))
                 .map(|(k, v)| Provider {
                     selector: Some(k.clone()),
                     proxy: v.clone(),
@@ -233,6 +234,7 @@ impl Config {
         {
             return Err(Error::config("Invalid port or timeout (1–3600 seconds)."));
         }
+        crate::url_routing::validate_routes(&self.routing.api_key)?;
         validate_upstream(&self.base_url.account)?;
         validate_upstream(&self.base_url.api_key)?;
         let accounts = !self.routing.account.is_empty() || self.routing.account_fallback.is_some();
@@ -322,7 +324,9 @@ impl Config {
             routing: Routing,
         }
         let mut routing = self.routing.clone();
-        routing.api_key.clear();
+        routing
+            .api_key
+            .retain(|key, _| crate::url_routing::is_url_selector(key));
         for p in &self.providers {
             if p.api_key_file.is_some()
                 || p.upstream_base_url.is_some()
