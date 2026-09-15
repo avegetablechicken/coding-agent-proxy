@@ -1,6 +1,6 @@
 use crate::{
     Error, Result,
-    config::{Config, Provider, expand, unwrap_upstream},
+    config::{AccountSource, Config, Provider, expand, unwrap_upstream},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
@@ -205,6 +205,32 @@ fn key(raw: &str) -> Result<String> {
     }
     Ok(k.into())
 }
+pub(crate) async fn environment_key(name: &str) -> Result<String> {
+    environment_key_with_shell(name, true).await
+}
+pub(crate) async fn environment_key_with_shell(name: &str, shell: bool) -> Result<String> {
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(_) if shell => shell_value(name).await?,
+        Err(_) => {
+            return Err(Error::config(
+                "API Key environment variable is unavailable.",
+            ));
+        }
+    };
+    key(&raw)
+}
+impl AccountSource {
+    pub(crate) async fn codex_identity(&self) -> Result<Identity> {
+        if let Some(name) = &self.auth_env {
+            let token = environment_key(name).await?;
+            return Identity::from_token(&token).ok_or(Error::config(
+                "Codex account token requires ChatGPT account claims.",
+            ));
+        }
+        Identity::read(self.auth_file.as_deref().unwrap_or("~/.codex/auth.json"))
+    }
+}
 #[cfg(unix)]
 async fn shell_value(name: &str) -> Result<String> {
     use std::{os::unix::process::CommandExt, process::Stdio};
@@ -276,31 +302,42 @@ async fn shell_value(_: &str) -> Result<String> {
 }
 
 impl Config {
-    pub fn account_choice(&self, identity: &Identity) -> Result<crate::config::Choice> {
-        self.routing
+    pub fn account_choice(
+        &self,
+        identity: &Identity,
+        source: Option<&str>,
+    ) -> Result<crate::config::Choice> {
+        self.codex
+            .routing
             .account
             .get(&identity.account_id)
             .or_else(|| {
                 identity
                     .usernames
                     .iter()
-                    .find_map(|u| self.routing.account.get(u))
+                    .find_map(|u| self.codex.routing.account.get(u))
             })
-            .or(self.routing.account_fallback.as_ref())
+            .or_else(|| source.and_then(|s| self.codex.routing.account.get(s)))
+            .or(self.codex.routing.account_fallback.as_ref())
             .cloned()
             .ok_or(Error::config(
                 "Current account has no proxy mapping; forwarding refused.",
             ))
     }
     pub async fn check_credentials(&self) -> Result<()> {
+        self.claude.check_credentials().await?;
         let mut keys = HashSet::new();
-        if self.account_auth_file_only && !self.auth_file.is_empty() {
-            let i = Identity::read(&self.auth_file)?;
-            self.account_choice(&i)?;
-            keys.insert(i.token);
+        if self.codex.account_auth_file_only {
+            for (label, source) in &self.codex.accounts {
+                let i = source.codex_identity().await?;
+                self.account_choice(&i, Some(label))?;
+                if !keys.insert(i.token) {
+                    return Err(Error::config("Multiple routes have the same credential."));
+                }
+            }
         }
-        for p in &self.providers {
-            if !keys.insert(p.credential(&self.base_url.api_key, true).await?.0) {
+        for p in &self.codex.providers {
+            if !keys.insert(p.credential(&self.codex.base_url.api_key, true).await?.0) {
                 return Err(Error::config("Multiple routes have the same credential."));
             }
         }
@@ -388,5 +425,85 @@ mod tests {
             409
         );
         assert!(c.check_credentials().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn symmetric_codex_sources_route_by_label_and_preserve_identity_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("b.json");
+        for (path, id, token) in [(&a, "id-a", "secret-a"), (&b, "id-b", "secret-b")] {
+            std::fs::write(
+                path,
+                json!({"tokens":{"account_id":id,"access_token":token}}).to_string(),
+            )
+            .unwrap();
+        }
+        let text = format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\nproxies:\n  selected: http://127.0.0.1:7893\ncodex:\n  accounts:\n    personal:\n      auth_file: {}\n    work:\n      auth_file: {}\n  routing:\n    account:\n      personal: selected\n      work: none\n",
+            serde_json::to_string(&a.to_string_lossy()).unwrap(),
+            serde_json::to_string(&b.to_string_lossy()).unwrap()
+        );
+        let mut c = Config::parse(&text).unwrap();
+        c.check_credentials().await.unwrap();
+        assert_eq!(
+            c.resolve(Some("Bearer secret-a"), true)
+                .await
+                .unwrap()
+                .proxy
+                .label(),
+            "selected"
+        );
+        assert_eq!(
+            c.resolve(Some("Bearer secret-b"), true)
+                .await
+                .unwrap()
+                .proxy
+                .label(),
+            "none"
+        );
+        c.codex
+            .routing
+            .account
+            .insert("id-a".into(), crate::config::Choice::direct());
+        assert_eq!(
+            c.resolve(Some("Bearer secret-a"), true)
+                .await
+                .unwrap()
+                .proxy
+                .label(),
+            "none"
+        );
+        c.codex
+            .accounts
+            .insert("duplicate".into(), c.codex.accounts["personal"].clone());
+        assert_eq!(
+            c.resolve(Some("Bearer secret-a"), true)
+                .await
+                .err()
+                .unwrap()
+                .status,
+            409
+        );
+        assert!(c.check_credentials().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_source_label_cannot_create_an_account_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("auth.json");
+        std::fs::write(
+            &file,
+            json!({"tokens":{"account_id":"unmapped","access_token":"secret"}}).to_string(),
+        )
+        .unwrap();
+        let old = format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\nauth_file: {}\nrouting:\n  account:\n    default: none\n",
+            serde_json::to_string(&file.to_string_lossy()).unwrap()
+        );
+        let c = Config::parse(&old).unwrap();
+        assert!(c.resolve(Some("Bearer secret"), true).await.is_err());
+        let migrated = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
+        assert!(migrated.resolve(Some("Bearer secret"), true).await.is_err());
     }
 }

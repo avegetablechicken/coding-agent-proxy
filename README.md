@@ -1,198 +1,233 @@
 # coding-agent-proxy
 
-A cross-platform Rust loopback reverse proxy for Codex model requests, ChatGPT account APIs and
-OpenAI documentation MCP. It selects an outbound proxy by matching ChatGPT or
+A cross-platform Rust loopback reverse proxy for Codex, Claude Code, ChatGPT account APIs and
+OpenAI documentation MCP. It selects an outbound proxy by matching account or
 API Key credentials. HTTP/SSE data is passed through without model or protocol conversion.
 
 ## Configuration
 
-Build with Rust 1.85+ and Cargo on macOS, Linux, or Windows. The Rust executable
-reads Codex TOML directly and has no Python runtime dependency. Python 3.10+ is
-only needed for the optional service manager and integration tests.
-
-Build and create a local configuration:
+Build with Rust 1.85+ and Cargo on macOS, Linux, or Windows:
 
 ```sh
 cargo build --locked --release
 cp config.example.yaml config.yaml
 ```
 
-On Windows PowerShell, use `Copy-Item config.example.yaml config.yaml` and
-`./target/release/coding-agent-proxy.exe` in place of the Unix executable path.
+On Windows PowerShell, use `Copy-Item` and `coding-agent-proxy.exe`.
+The executable has no Python runtime dependency; Python 3.10+ is needed only
+for the optional service manager and integration tests.
 
-The release build and offline tests have been verified on macOS and Ubuntu
-20.04 x86_64, including Rust 1.85.1 on Ubuntu. Windows still requires native
-verification. CI builds, tests, and packages binaries for all three platforms
-and separately checks the minimum Rust version.
+The top level contains shared server settings and named proxies. **Codex and
+Claude each have their own `auth_file`, `base_url`, and `routing` settings**:
 
 ```yaml
-listen_port: 7889
-auth_file: "~/.codex/auth.json"
+listen_port: 8787
 request_timeout_seconds: 300
-
-base_url:
-  account: "https://chatgpt.com/backend-api"
-  api_key: "https://api.openai.com/v1"
 
 proxies:
   us: "http://127.0.0.1:7891"
-  jp: "http://127.0.0.1:7892"
+  claude_official: "http://127.0.0.1:7893"
 
-routing:
-  account:
-    "you@example.com": jp
-  api_key:
-    OPENAI_API_KEY: us
-    ShareCoder: none
-  # account_fallback: jp
-  # api_key_fallback: us
-  # mcp_fallback: jp
+codex:
+  base_url:
+    account: "https://chatgpt.com/backend-api"
+  auth_file: "~/.codex/auth.json"
+  account_auth_file_only: true
+  routing:
+    account:
+      default: us
+    # api_key:
+    #   OPENAI_API_KEY: us
+
+claude:
+  base_url: "https://api.anthropic.com"
+  auth_file: "~/.claude/.credentials.json"
+  account_auth_file_only: true
+  routing:
+    account:
+      default: claude_official
+    # api_key:
+    #   ANTHROPIC_API_KEY: claude_official
 ```
 
-`base_url.account` is the shared ChatGPT backend root. Model endpoints use its
-`/codex` namespace; usage and plugin APIs use `/wham` and `/ps`. The legacy
-`/backend-api/codex` base is normalized for account requests. `base_url.api_key`
-is the default API Key upstream and the destination for unmatched keys when
-`routing.api_key_fallback` is configured.
+Either service section can be omitted. Within each section:
 
-`proxies` defines named HTTP CONNECT, HTTPS CONNECT or SOCKS5 endpoints. The
-reserved value `none` selects direct access, and a proxy alias may also map to
-`none`. Proxy URLs require explicit ports. The service clears inherited HTTP/SOCKS
-proxy environment variables and disables system/PAC proxy discovery for direct routes.
+| Field | Purpose |
+| --- | --- |
+| `base_url` | Claude: one upstream root for both OAuth and API Keys |
+| `base_url.account` | Codex: ChatGPT account upstream |
+| `base_url.api_key` | Codex: API Key upstream; defaults to `https://api.openai.com/v1` |
+| `auth_file` | Saved account credential file |
+| `auth_env` | Alternative: environment variable containing the account access token |
+| `routing.account.<label>` | Proxy choice for that account source |
+| `routing.api_key.<selector>` | Proxy choice for an API Key environment variable (Codex also accepts provider IDs) |
+| `routing.account_fallback` | Proxy choice for an account without an explicit mapping |
+| `routing.api_key_fallback` | Proxy choice for an unmatched API Key credential |
 
-`routing.account` accepts a login email or username as the key, for example
-`"you@example.com": jp`. Account IDs remain supported. Matching is exact and
-tries account ID first, then `email`, `preferred_username`, and `name` from the
-saved login tokens. For each field, the access token's OpenAI profile takes
-priority over its top-level claims, then the ID token's claims. Use email when
-possible; display names may be shared by multiple accounts. If no key matches,
-`account_fallback` applies as before.
+Place `auth_file` directly under `codex` or `claude`; the saved login is named
+`default` in `routing.account`. `auth_env` is an alternative environment variable
+source and cannot be combined with `auth_file`. Files are read per request, so
+credential rotation takes effect without restarting. The clients handle login
+and token refresh; keychain-only credentials are not read by this service.
 
-By default (`account_auth_file_only: true`), a request must match the saved access token; a supplied account header
-must match the actual account ID, even when routing by email. Username metadata
-is read from `auth.json` on each request, so login changes take effect immediately.
-Missing or malformed token metadata leaves ID routing and fallback available.
-Credentials stored only in a keychain are unsupported. Codex remains responsible
-for login and token refresh.
+Only configure `routing.api_key` when needed. Migration omits empty API Key maps
+and unused default Codex API Key base URLs. Existing configured API Key routes
+are retained. Older nested `accounts` remain readable for compatibility; do not
+mix them with direct `auth_file`/`auth_env`. Multiple or ambiguous legacy named
+sources remain nested when flattening would alter routing.
 
-Set top-level `account_auth_file_only: false` to accept other ChatGPT access tokens.
-In this mode `auth_file` may be omitted or unavailable. The service decodes the
-incoming access token's `https://api.openai.com/auth.chatgpt_account_id` and profile
-metadata to select the account ID/email/username route, or `account_fallback`.
-The supplied account header must still match that token's account ID. Decoded
-claims are routing hints, not local signature verification; the ChatGPT upstream
-validates the forwarded token. Email routing requires email in that access token;
-the service cannot recover another account's ID token or look up email addresses.
-Configured API Key routes and API/MCP fallbacks retain their existing behavior.
-`--check` in this mode checks configuration and API Key sources without requiring
-a saved ChatGPT login. Restart the service after changing this setting.
+### Service-specific matching
 
-`routing.api_key` uses the same key-to-proxy mapping as `routing.account`.
-Credential selectors are either exact Codex provider IDs (`ShareCoder: none`) or environment
-variable names (`OPENAI_API_KEY: us`). Values may be a proxy name, `none`, or an
-ordered proxy list. List-of-object entries and nested `name`, `proxy`,
-`api_key_env`, `api_key_file` or `upstream_base_url` fields are not accepted here.
+Codex account routing tries account ID, then email/preferred username/name from
+the login tokens, then the matched source label, then `codex.routing.account_fallback`.
+A supplied `ChatGPT-Account-Id` must match the token's actual account ID.
+Access-token profile metadata takes precedence over top-level claims and ID-token
+metadata. These are routing hints; upstream authentication still validates tokens.
 
-A key first matches a Codex provider ID; its `env_key` identifies the credential.
-Otherwise the key is treated as an environment variable name and may reverse-match
-a provider by `env_key`. Multiple reverse matches are rejected; use the provider ID
-to disambiguate. A variable with no matching provider uses `base_url.api_key`.
-The built-in `openai` provider also uses `base_url.api_key`, independently of
-Codex's `openai_base_url`. Custom provider upstreams come from Codex's provider
-`base_url`, including supported explicit local wrapper URLs. Configure custom
-upstreams in Codex rather than adding fields to this mapping.
-All upstreams must be HTTPS public hostnames. API Keys are not converted into
-ChatGPT login credentials, and ChatGPT tokens are not converted into API Keys.
+Both services support `account_auth_file_only`, defaulting to `true`:
 
-| Fallback field | When used | If omitted/null |
+| Mode | Codex | Claude |
 | --- | --- | --- |
-| `routing.account_fallback` | A verified ChatGPT token has no account mapping | Reject the account route |
-| `routing.api_key_fallback` | A supplied Bearer token matches no configured credential | Reject the API request |
-| `routing.mcp_fallback` | Public documentation MCP cannot select a credential route | Direct MCP access |
+| `true` | Require a configured saved token and read its account claims | Require a configured saved token and read the local CLI account metadata |
+| `false` | Also accept other ChatGPT tokens using their JWT claims | Also accept other OAuth tokens after a successful profile lookup |
 
-Each fallback references a name under `proxies`, or `none` for explicit direct
-access. Explicit matched routes take priority, including routes selecting `none`.
-Missing authentication does not activate account/API fallback. Duplicate credential
-matches remain errors for model/usage requests; public MCP uses its own fallback.
-Once an outbound proxy is selected, connection/authentication failures do not switch
-proxies or silently fall back to direct access.
+For Claude's standard `~/.claude/.credentials.json`, account metadata comes from
+`~/.claude.json` → `oauthAccount`. Custom credential directories use their own
+`.claude.json`; they do not inherit another login's home metadata. UUID, email,
+display name, and full name are matched in that order, followed by the source
+label (`default` for flat `auth_file`) and `claude.routing.account_fallback`.
+Metadata refreshes per request. Missing/malformed metadata leaves explicit source
+label and fallback routing available. An environment-backed account source has
+no associated metadata file and uses its configured label/fallback.
 
-### Ordered proxy candidates
+In `true` mode, even an explicit account fallback cannot admit an unmatched token.
+In `false` mode, `auth_file` may be omitted or unavailable and `--check` skips saved
+account requirements, just as for Codex. Matched local tokens still use local
+metadata; it is never reused for a different incoming token.
 
-Every routing proxy value accepts either a name or an ordered list, including
-account/API Key routes and all three fallback fields:
+Claude tokens are opaque, so an unknown token requires `GET /api/oauth/profile`
+on `claude.base_url`. Before identity is known, **`claude.routing.account_fallback`
+provides the lookup proxy** (including ordered candidates). It must be explicitly
+configured; no implicit direct route or another account's proxy is used. Only the
+Bearer token and profile-request headers are sent, without model payload, cookies
+or client headers. The account returned by the API selects the final UUID/email
+route for the model request. Example:
 
 ```yaml
-routing:
-  account:
-    "account-id": [jp, us]
-  api_key:
-    OPENAI_API_KEY: [us, jp]
-  account_fallback: [jp, us]
-  api_key_fallback: [us, jp, none]
-  mcp_fallback: [jp, none]
+claude:
+  base_url: "https://api.anthropic.com"
+  account_auth_file_only: false
+  routing:
+    account:
+      "you@example.com": claude_official
+    account_fallback: claude_official
 ```
 
-A scalar preserves existing behavior without probing. For a list, each request
-checks candidates sequentially and stops at the first available one. Probes use
-an unauthenticated `HEAD /` to the actual upstream HTTPS origin (including its
-port), without model tokens, account headers, request bodies or query parameters.
-A candidate is available when TLS/HTTP succeeds with a status from 200–499 other
-than 407; 401/403/404/405 can establish transport reachability without credentials.
-This does not verify model permissions or guarantee that the subsequent API call
-will succeed. Redirects are not followed. Each probe is limited to 5 seconds or
-`request_timeout_seconds`, whichever is lower. Selection is repeated per request.
+Successful profile identities are cached in memory per token for 5 minutes, up
+to 128 entries. Tokens without profile permission, rejected tokens, malformed
+profiles and transport failures do not forward the model payload and are not
+cached. Lookup redirects are not followed. Lookup errors never trigger a direct
+retry. Profiles are limited to 64 KiB and lookup time to 10 seconds or the configured
+request timeout, whichever is lower. API Key routes are unaffected by this flag.
+Missing authentication never activates any fallback.
 
-Empty lists and unknown proxy names are rejected at startup. `none` is probed as
-a direct connection only when explicitly included. If every candidate fails,
-the request returns 502 without sending its business payload. Once selected,
-the actual request is sent only once: an API/streaming failure does not replay it
-through another candidate. The next request starts selection from the first
-candidate again. Logs include a redacted `proxy_probe` event for each attempted
-candidate and the selected proxy in `route_selected`.
+Codex API Key URL selectors match explicit upstream requests (see below).
+Other selectors first match Codex provider IDs; otherwise they are treated
+as environment variable names and may reverse-match a provider by `env_key`.
+Multiple reverse matches are rejected. The built-in `openai` provider and unmatched
+variables use `codex.base_url.api_key`; custom providers use the `base_url` in
+Codex's `config.toml`, including supported explicit local wrapper URLs.
+Claude API Key selectors can be environment variable names (using `claude.base_url`)
+or explicit HTTPS upstream bases, as described below. Matched API credentials
+may use Bearer or `x-api-key`; they do not trigger OAuth profile lookup or receive
+injected OAuth beta flags. Requests matching multiple credentials in a
+namespace are rejected. The two services never use each other's fallbacks.
 
-YAML is loaded once at startup. Account mappings, upstreams, proxy credentials,
-fallbacks and timeouts require a restart after editing. `auth.json` is read per request so credential rotation can take effect without restart.
-Codex provider configuration lookup retains its existing request-time behavior.
+Codex alone supports `codex.routing.mcp_fallback` for public OpenAI documentation
+MCP. Omitted/null/`none` means direct MCP access. Explicit matched routes take
+priority. Account/API fallbacks default to rejection when omitted/null.
 
-For environment-backed API Keys, process variables take priority. On macOS and Linux, if a variable
-is absent, the service runs the user's login/interactive zsh, bash or sh at
-request time and reads that one exported variable. For zsh this follows the usual
-`.zshenv`, `.zprofile`, `.zshrc` and `.zlogin` loading rules. Startup output is
-ignored; lookup times out after 3 seconds and never logs values. Shell scripts
-must complete without terminal interaction. Requests already matched to a
-ChatGPT login do not start a shell to resolve unrelated API keys. Windows reads
-API Keys from the process environment; it does not execute PowerShell profiles.
-For example, set `$env:OPENAI_API_KEY` before starting the executable in PowerShell.
-Use `~/...` paths or forward slashes in YAML; Windows backslashes must be escaped
-inside double-quoted YAML strings. Keychain-only credentials remain unsupported.
+### Upstreams, proxies and ordered candidates
+
+Default upstreams must be HTTPS public hostnames; explicitly declared third-party
+Claude API routes may also use public IPv4 addresses. Codex's account base is the ChatGPT
+backend root: model requests use `/codex`, usage uses `/wham`, and plugin APIs use
+`/ps`. A legacy `/backend-api/codex` base is normalized to `/backend-api`.
+Claude's single base URL is a root **without `/v1`**: native `/v1` and
+`/api/oauth` paths are preserved. The Claude base may point to a compatible
+Anthropic gateway; no model or protocol conversion is performed.
+
+`proxies` defines named HTTP CONNECT, HTTPS CONNECT or SOCKS5 endpoints. URLs
+require explicit ports. Reserved `none` selects direct access; a proxy alias may
+also map to `none`. Transport clients disable inherited/system proxy discovery:
+all outbound selection happens in this service, independently of client proxy
+environment variables.
+
+Every routing value accepts a proxy name, `none`, or an ordered list.
+Proxy candidate lists are always written inline, for example `[jp_lab, jp]`;
+migration preserves their order and avoids multiline lists:
+
+```yaml
+codex:
+  routing:
+    api_key:
+      OPENAI_API_KEY: [us, jp]
+    api_key_fallback: [us, jp, none]
+    mcp_fallback: [jp, none]
+claude:
+  routing:
+    api_key:
+      ANTHROPIC_API_KEY: claude_official
+```
+
+Merge those entries into the appropriate service sections, with proxy names
+defined under `proxies`. Scalar routes send directly through the selected proxy.
+Lists probe candidates sequentially with unauthenticated `HEAD /` requests to
+the actual upstream HTTPS origin, without model tokens, account headers, bodies
+or query parameters. HTTP 200–499 other than 407 establishes reachability;
+redirects are not followed. Each probe is limited to 5 seconds or the request
+timeout, whichever is lower. Selection repeats per request. Empty lists and
+unknown names are rejected at startup. All failed candidates return 502.
+The payload is sent once; API/streaming failures never replay it on another proxy.
+
+YAML is loaded at startup. Restart after changing routes, upstreams, proxies or
+timeouts. Codex provider metadata and account credential files refresh per request.
+Environment-backed credentials use process variables first. On macOS/Linux, an
+absent variable is read from the user's login/interactive zsh, bash or sh, with a
+3-second timeout and no logged values. Windows uses process variables only.
+Shell startup must not require terminal interaction. Saved Codex account matches
+do not launch a shell to resolve unrelated API Key providers.
 
 ```sh
 target/release/coding-agent-proxy --config config.yaml --check
 target/release/coding-agent-proxy --config config.yaml
 ```
 
-`--check` validates configuration and credentials, not proxy reachability. Stop
-with Ctrl-C or SIGTERM. An MCP-only service can omit account and API Key routes.
+`--check` validates configuration and enabled credential sources, not network
+reachability. Stop with Ctrl-C or SIGTERM.
 
 ### Migrate older configurations
 
-Legacy top-level `upstream_base_url` / `account_upstream_base_url`,
-`api_key_upstream_base_url`, `accounts`, `api_key_providers`,
-`openai_fallback_proxy` and `mcp_fallback_proxy` are accepted for migration.
-Do not mix old upstream keys with `base_url`, or old routing keys with `routing`.
-The migration command writes a private file without printing its credentials:
+Older top-level Codex `auth_file`, `account_auth_file_only`, `base_url` and `routing`
+are still accepted, along with the earlier legacy upstream/provider fields.
+Old Claude inline `accounts.<label>.proxy`, `api_key` and fallback fields are also
+accepted. A legacy split Claude base URL is accepted only when both URLs agree. Do not mix `codex` with top-level Codex fields,
+or Claude's new `routing` with its old inline routing fields: ambiguous settings
+are rejected, including explicit null legacy keys.
+
+The migration command writes the symmetric layout to a private file:
 
 ```sh
 target/release/coding-agent-proxy --config config.yaml --write-config config.new.yaml
 target/release/coding-agent-proxy --config config.new.yaml --check
 ```
 
-It converts old API Key object lists to mapping keys when representable. Entries
-with Key files, per-route upstream overrides or duplicate selectors require manual
-migration into Codex provider/environment configuration; migration refuses to
-silently discard those settings. It preserves proxy URLs and normalizes the account base
-to `/backend-api`. Back up the active config before replacing it, then restart.
+It flattens single saved-login files into each service section, preserves ID/email
+routing and proxy choices, and writes one Claude base URL. Claude source labels
+become `default` when flattened. Empty API Key maps are omitted. Both formats behave the same
+after migration. Legacy API Key entries with per-route upstream overrides, key
+files or unrepresentable duplicate selectors are refused instead of silently
+losing settings. Back up the active configuration before replacing it, then restart.
 
 ## Connect Codex
 
@@ -218,52 +253,44 @@ GET and a matched ChatGPT login; API Keys cannot read subscription limits.
 The explicit upstream URL form also works, for example:
 `http://127.0.0.1:7889/https://chatgpt.com/backend-api/codex/responses` or
 `http://127.0.0.1:7889/https://provider.example.com/v1/responses`.
-The HTTPS origin and API path must match the credential's configured upstream
-or an explicitly declared URL route (below).
+The HTTPS origin and API path must match the credential's configured upstream.
 There is no arbitrary unauthenticated URL forwarding or `?base_url=` parameter.
 
-### Route API requests by upstream URL
+### Codex API URL routes
 
-`routing.api_key` also accepts explicit HTTPS upstream bases as keys:
+`codex.routing.api_key` accepts upstream URLs as well as provider IDs and
+environment variables:
 
 ```yaml
-routing:
-  api_key:
-    "provider.example.com": [jp, us]
-    "provider.example.com/v1": jp
-    "182.92.106.196:6060": none
+codex:
+  routing:
+    api_key:
+      "provider.example.com/v1": [jp, us]
+      "https://182.92.106.196:6060": none
 ```
 
-The scheme and API path are optional in routing keys. `api.example.com`
-defaults to HTTPS and matches every path on that host and port;
+Set the Codex client base URL to
+`http://127.0.0.1:8787/codex/https://provider.example.com/v1`.
+URL routes require a Bearer token, which the upstream validates; they do not
+require a local provider credential source or a fallback. They preserve request
+paths, queries, bodies and streaming responses. `--check` and migration recognize
+URL selectors without looking them up as environment variables.
+
+In routing keys, both `https://` and the API path may be omitted. A key such as
+`api.example.com` defaults to HTTPS and matches every path on that origin;
 `api.example.com/v1` is more specific and wins for `/v1` and `/v1/...`, but not
-`/v1-other`. Requests retain their original path. Ports still match exactly
-(omitted means 443). `//api.example.com/v1` is also accepted. Equivalent full and
-scheme-less keys cannot both be configured. Keys containing a dot, colon or
-slash are URL selectors; ordinary provider IDs and environment variable names
-remain credential selectors.
+`/v1-other`. The longest matching path wins and the request path is not rewritten.
+Ports still match exactly (omitted means 443). `//api.example.com/v1` is also
+accepted. Equivalent spellings cannot be configured twice. Keys containing a
+dot, colon or slash are interpreted as URL selectors; plain provider IDs and
+environment-variable names remain credential selectors. Client base URLs still
+use the explicit `http://127.0.0.1:8787/.../https://...` form.
 
-Set the client base URL to `http://127.0.0.1:7889/https://provider.example.com/v1`
-or `http://127.0.0.1:7889/codex/https://provider.example.com/v1`.
-A declared URL route selects its proxy before provider/environment credential
-lookup. A nonempty Bearer token is still required and is validated by the
-upstream. No local key source or fallback is needed. Requests retain their
-path, query, body and streaming responses. Unmatched URLs retain the existing
-credential-based routing rules; there is no arbitrary unauthenticated forwarding.
-
-Matching checks scheme, host, port and API path boundaries; the longest matching
-base wins. Equivalent duplicate URL bases are rejected. Declared API URL routes
-may use public IPv4 addresses; private, loopback and link-local IPs remain rejected.
-Migration preserves URL keys, and `--check` does not treat them as environment
-variable names. Proxy lists use the existing credential-free probes and never
-replay payloads after an upstream error.
-
-Explicit API routes use native TLS for compatibility with common API gateways;
-normal routes retain rustls. Both verify certificates and hostname/IP identity.
-Linux builds vendor OpenSSL and require a C compiler, make and Perl, but no
-system libssl runtime. For a custom CA on Linux, set the service's `SSL_CERT_FILE`
-to a bundle containing the system CAs and the additional certificate, then restart.
-Other platforms use their native certificate stores. TLS verification stays enabled.
+Codex and Claude share the same origin/path matcher, public-IP validation, ordered
+proxy selection and verified TLS transport for explicit URL routes. If both apps
+configure matching URL routes, an unprefixed `/https://...` request returns 409;
+use `/codex/https://...` or `/anthropic/https://...` to select the application.
+A URL declared for only one app also works with the unprefixed form.
 
 ### OpenAI documentation MCP
 
@@ -275,10 +302,105 @@ enabled = true
 
 No helper or per-session configuration is required. The destination is fixed to
 `https://developers.openai.com/mcp`. A matching optional Bearer credential selects
-the same route as model requests. Otherwise `routing.mcp_fallback` applies;
+the same route as model requests. Otherwise `codex.routing.mcp_fallback` applies;
 with the URL-only configuration above, requests normally use that fallback.
 Model tokens, account IDs, cookies and other private headers are not sent to the
 public MCP upstream. MCP session/protocol headers, JSON and SSE are preserved.
+
+## Connect Claude Code / Anthropic
+
+Configure `claude.auth_file` and `claude.routing` as shown above, then set this
+persistent environment entry in Claude Code's `~/.claude/settings.json` (merge
+with existing settings):
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/anthropic"
+  }
+}
+```
+
+Use your configured `listen_port`. Start `claude` normally. Outbound proxies
+belong in this service's YAML; no proxy environment variables are needed in the
+Claude configuration. For a one-time invocation:
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic claude
+```
+
+The `/anthropic` prefix is removed before forwarding (`/claude` remains an alias).
+Messages, token counting, model listing and other native API paths retain `/v1`
+and query strings. Unprefixed `/v1/messages`, `/v1/messages/...`, and `/api/oauth/...`
+also select Claude. Use `/anthropic/v1/models` for the ambiguous models path.
+Explicit URLs must match either a declared API URL route or the default
+`claude.base_url` origin and base path. See third-party routing below.
+
+API credentials preserve the incoming `x-api-key` or `Authorization: Bearer ...`
+header; subscription credentials use Bearer authentication. Requests containing both are rejected. Client
+`anthropic-version`, beta flags, user agent, JSON and SSE are preserved.
+Missing `anthropic-version` defaults to `2023-06-01`; OAuth account requests merge
+`oauth-2025-04-20` into existing beta flags. Cookies, proxy credentials and
+ChatGPT account headers are removed. Upstream errors and rate-limit headers pass
+through unchanged. `GET /anthropic/api/oauth/usage` requires a matched local OAuth account or an
+account identified by the profile API in `false` mode. API Keys cannot use it.
+
+Claude Code remains responsible for login and token refresh. The proxy reads
+credentials without changing them; it does not implement login, token refresh,
+macOS Keychain discovery, or OpenAI-to-Anthropic conversion. A keychain-only login
+needs an explicit environment-backed credential or an account fallback.
+OAuth clients must still satisfy Anthropic's upstream client requirements.
+
+Implementation references: OpenQuota's local Claude credential reader and usage
+client, and Sub2api's [Anthropic forwarding](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/service/gateway_anthropic_passthrough.go)
+and [Claude header definitions](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/pkg/claude/constants.go).
+
+### Third-party Claude APIs
+
+A custom shell command or `claude --settings <file>` may load settings from any
+path. This service does not assume a `profiles` directory and does not infer a
+settings filename from an opaque token. Declare the third-party upstream directly:
+
+```yaml
+claude:
+  base_url: "https://api.anthropic.com"
+  auth_file: "~/.claude/.credentials.json"
+  account_auth_file_only: true
+  routing:
+    account:
+      "you@example.com": claude_official
+    api_key:
+      "https://182.92.106.196:6060": none
+```
+
+Point the third-party client's `ANTHROPIC_BASE_URL` to:
+
+```text
+http://127.0.0.1:8787/https://182.92.106.196:6060
+```
+
+`/anthropic/https://...` is also supported. The local listener uses **HTTP**;
+the embedded upstream uses **HTTPS**. The URL route applies to Messages, token
+counting, model discovery, and other paths under that configured base. The
+longest matching base path wins; scheme, host, port and path boundaries must
+match. Undeclared destinations cannot use another route. A configured public
+IPv4 upstream is supported; private, loopback and link-local IPs are rejected.
+
+These routes require one nonempty `Authorization: Bearer ...` or `x-api-key`
+header. They select the proxy by the declared upstream; the upstream validates
+the forwarded API credential. They are independent of `account_auth_file_only`
+and require no account/API fallback. `none` explicitly selects direct access.
+Requests and SSE pass through unchanged, with no OAuth conversion or model
+rewriting. Environment-variable API selectors continue to match credentials
+locally. Explicit URL routes need no token in this service's configuration.
+
+A custom CA supplied to the Claude client does not automatically become trusted
+by the proxy. Explicit API routes use native TLS for compatibility with Node/OpenSSL;
+Credential-based Codex routes and default Claude routes retain rustls. Both verify certificates and
+hostname/IP identity. On Linux, supply a self-signed API certificate through the
+service's `SSL_CERT_FILE` CA bundle (include the system CAs), and restart. Other
+platforms use their native certificate stores. Linux builds vendor OpenSSL and
+require a C toolchain, make and Perl; no system libssl runtime is needed. No settings-directory discovery or disabled TLS verification is needed.
 
 ## Run as a background service
 
@@ -503,7 +625,7 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 
 ## Limits and troubleshooting
 
-- The upstream must use HTTPS and a public service hostname. IP addresses and local hostnames are rejected to preserve the existing upstream validation policy.
+- Default upstreams require HTTPS and a public service hostname. Explicit Claude API URL routes also accept public IPv4 addresses; private addresses and local hostnames remain rejected.
 - Proxy URLs require an explicit port and support `http`, `https`, or `socks5`. Optional username/password authentication uses `scheme://username:password@host:port`. Credentials are removed from logged proxy URLs.
 - Inbound limits: 32 MiB request body, 64 KiB headers, 128 concurrent connections, and a 30-second read timeout. Content-Length and chunked uploads are supported; each connection handles one request.
 - `Expect: 100-continue` returns HTTP 417. WebSocket Upgrade returns HTTP 426.

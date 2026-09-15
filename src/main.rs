@@ -51,7 +51,7 @@ async fn run(args: Args) -> Result<()> {
             .map_err(|_| Error::config("Cannot sync configuration."))?;
         temp.persist(destination)
             .map_err(|_| Error::config("Cannot replace configuration."))?;
-        println!("Wrote configuration using base_url and routing sections.");
+        println!("Wrote configuration using symmetric codex and claude sections.");
         return Ok(());
     }
     if args.print_listen_port {

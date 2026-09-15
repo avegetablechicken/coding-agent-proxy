@@ -1,3 +1,5 @@
+pub mod claude;
+mod claude_api;
 pub mod config;
 pub mod identity;
 pub mod logger;

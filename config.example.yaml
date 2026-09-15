@@ -1,52 +1,57 @@
-# Copy to config.yaml. YAML is loaded once; restart after changing it.
+# Shared server settings. Restart after changing YAML.
 listen_port: 8787
-auth_file: "~/.codex/auth.json"
-# Default true: only accept the ChatGPT credential saved in auth_file.
-# Set false to route other ChatGPT access tokens; auth_file becomes optional.
-account_auth_file_only: true
 request_timeout_seconds: 300
 
-base_url:
-  account: "https://chatgpt.com/backend-api"
-  api_key: "https://api.openai.com/v1"
-
-# HTTP CONNECT, HTTPS CONNECT or SOCKS5; an explicit port is required.
-# Optional username/password: http://user:password@host:port
-# Percent-encode reserved credential characters, e.g. @ -> %40.
+# HTTP CONNECT, HTTPS CONNECT or SOCKS5; explicit ports required.
 proxies:
   us: "http://127.0.0.1:8101"
   jp: "socks5://127.0.0.1:8102"
-  # authenticated: "http://proxy-user:proxy-password@proxy.example.com:8080"
+  claude_official: "http://127.0.0.1:7893"
 
-routing:
-  account:
-    "you@example.com": us
-    "replace-with-jp-account-id": jp
+codex:
+  base_url:
+    account: "https://chatgpt.com/backend-api"
+  auth_file: "~/.codex/auth.json"
+  # auth_env: CHATGPT_ACCESS_TOKEN # Alternative to auth_file, not both.
+  account_auth_file_only: true
+  routing:
+    account:
+      default: [us, jp]
+      # "you@example.com": jp # ID/email/username takes priority over default.
+    # account_fallback: jp
+    # mcp_fallback: jp # Public documentation MCP; omitted means direct.
 
-  # Keys are Codex provider IDs or environment variable names, not secret values.
-  # Provider IDs are matched first. Unknown variable names use base_url.api_key.
-  # api_key:
-  #   ShareCoder: none
-  #   OPENAI_API_KEY: us
-  #   SECOND_OPENAI_API_KEY: [jp, us]
-  # URL routes may omit https:// and /v1; the longest matching path wins.
-  # A supplied Bearer token is required, but no local credential source:
-  #   "provider.example.com/v1": [jp, us]
-  #   "182.92.106.196:6060": none
-  # Client base: http://127.0.0.1:8787/codex/https://provider.example.com/v1
+claude:
+  base_url: "https://api.anthropic.com" # Root without /v1.
+  auth_file: "~/.claude/.credentials.json"
+  # auth_env: CLAUDE_CODE_OAUTH_TOKEN # Alternative to auth_file, not both.
+  account_auth_file_only: true
+  routing:
+    account:
+      default: claude_official
+      # "you@example.com": claude_official # UUID/email/name precedes default.
+    # account_fallback: claude_official
+  # With account_auth_file_only: false, other tokens are identified via profile API.
+  # account_fallback supplies the lookup proxy before the account is known.
+  # With true, unmatched tokens are rejected even when a fallback exists.
 
-  # All fallback fields reference proxies above, or none for explicit direct access.
-  # Account: only a verified ChatGPT token without an account mapping can use it.
-  # account_fallback: jp
-  # API Key: unmatched Bearer tokens go to base_url.api_key; missing auth is refused.
-  # api_key_fallback: us
-  # Public MCP: no matching credential route; omitted/null/none means direct.
-  # mcp_fallback: jp
+# Omit API Key entries unless configured. To enable them, add under routing:
+# codex.routing.api_key.OPENAI_API_KEY: us
+# claude.routing.api_key.ANTHROPIC_API_KEY: claude_official
+# Codex also accepts provider IDs. Its API base defaults to https://api.openai.com/v1;
+# configure codex.base_url.api_key only to select a different default upstream.
+# Every proxy choice accepts a name, none, or an ordered list such as [us, jp].
+# Lists probe the upstream origin before sending; all failed -> 502, no replay.
+# Both apps support explicit upstream URL routes without local credential lookup:
+# codex.routing.api_key."provider.example.com/v1": [jp, us]
+# Codex client base: http://127.0.0.1:8787/codex/https://provider.example.com/v1
+# A third-party Claude API can also be matched by its configured upstream:
+# claude.routing.api_key."182.92.106.196:6060": none
+# Its client base URL: http://127.0.0.1:8787/https://182.92.106.196:6060
+# This route uses the supplied API credential and does not require a fallback.
+# Claude Code settings.json env:
+#   ANTHROPIC_BASE_URL: http://127.0.0.1:8787/anthropic
+# Outbound proxies belong here, not in Claude's environment.
 
-# Any routing proxy value also accepts ordered candidates, for example:
-# routing.account.<account-id>: [jp, us]
-# routing.api_key.OPENAI_API_KEY: [us, jp]
-# routing.account_fallback: [jp, us]
-# routing.api_key_fallback: [us, jp, none]
-# routing.mcp_fallback: [jp, none]
-# Lists probe the upstream origin before sending each request. All failed -> 502.
+# URL routing keys may omit https:// and /v1. A host-only key matches all paths;
+# an explicit path wins when it is the longest matching path prefix.

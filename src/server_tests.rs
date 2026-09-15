@@ -74,8 +74,17 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     io.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
                 }
                 let Ok(tls)=acceptor.accept(io).await else { return; }; let mut io:TestIo=Box::new(tls);
-                let request=read_request(&mut io).await.unwrap(); let head=request.starts_with("HEAD "); tx.send(request).unwrap();
+                let request=read_request(&mut io).await.unwrap(); let head=request.starts_with("HEAD "); let profile=request.starts_with("GET /api/oauth/profile "); tx.send(request).unwrap();
                 if head { io.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap(); }
+                else if profile {
+                    let (status, body) = match response_mode {
+                        "profile_unauthorized" => (401, "{}"),
+                        "profile_invalid" => (200, "{}"),
+                        "profile_redirect" => (302, "{}"),
+                        _ => (200, r#"{"account":{"uuid":"remote-account","email":"remote@example.invalid"}}"#),
+                    };
+                    io.write_all(format!("HTTP/1.1 {status} Profile\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
                 else if response_mode=="redirect" { io.write_all(b"HTTP/1.1 302 Found\r\nLocation: https://evil.invalid/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap(); }
                 else {
                     io.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close, x-hop\r\nx-hop: remove-me\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nD\r\ndata: first\n\n\r\n").await.unwrap(); io.flush().await.unwrap();
@@ -131,7 +140,6 @@ async fn running(config: &str) -> Running {
     }
 }
 use futures_util::FutureExt;
-
 #[tokio::test]
 async fn codex_url_routes_stream_through_declared_transport_without_credential_lookup() {
     for mode in ["direct", "http"] {
@@ -173,6 +181,76 @@ async fn codex_url_routes_stream_through_declared_transport_without_credential_l
         assert!(!log.contains("url-route-secret"));
     }
 }
+
+#[tokio::test]
+async fn application_namespaces_disambiguate_shared_api_upstreams() {
+    let mut codex = fixture("http", "redirect").await;
+    let mut claude = fixture("http", "redirect").await;
+    let codex_endpoint = format!("http://127.0.0.1:{}", codex.addr.port());
+    let claude_endpoint = format!("http://127.0.0.1:{}", claude.addr.port());
+    let running = running(&format!("proxies:\n  codex: {codex_endpoint}\n  claude: {claude_endpoint}\ncodex:\n  routing:\n    api_key:\n      'https://upstream.invalid/v1': codex\nclaude:\n  routing:\n    api_key:\n      'https://upstream.invalid/v1': claude\n")).await;
+    trust(&running, &codex, &codex_endpoint);
+    trust(&running, &claude, &claude_endpoint);
+    let response = http()
+        .get(format!(
+            "{}/https://upstream.invalid/v1/models",
+            running.url
+        ))
+        .bearer_auth("key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert!(codex.requests.try_recv().is_err());
+    assert!(claude.requests.try_recv().is_err());
+    let response = http()
+        .post(format!(
+            "{}/codex/https://upstream.invalid/v1/responses",
+            running.url
+        ))
+        .bearer_auth("key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 302);
+    assert!(codex.requests.recv().await.unwrap().starts_with("CONNECT "));
+    assert!(
+        codex
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /v1/responses ")
+    );
+    assert!(claude.requests.try_recv().is_err());
+    let response = http()
+        .post(format!(
+            "{}/anthropic/https://upstream.invalid/v1/messages",
+            running.url
+        ))
+        .bearer_auth("key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 302);
+    assert!(
+        claude
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT ")
+    );
+    assert!(
+        claude
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /v1/messages ")
+    );
+    assert!(codex.requests.try_recv().is_err());
+}
 fn trust(running: &Running, fixture: &Fixture, endpoint: &str) {
     for native_tls in [false, true] {
         let mut client = reqwest::Client::builder()
@@ -212,6 +290,288 @@ fn http() -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
+}
+
+// Synthetic upstream.invalid traffic stays entirely on loopback. No Anthropic
+// host, real credential, or external proxy is contacted by this fixture.
+#[tokio::test]
+async fn claude_native_auth_paths_and_sse_passthrough() {
+    for bearer in [false, true] {
+        let mut fixture = fixture("http", "sse").await;
+        let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+        let credentials = tempfile::tempdir().unwrap();
+        let file = credentials.path().join("credentials.json");
+        std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"model-secret"}}"#).unwrap();
+        let file = serde_json::to_string(&file.to_string_lossy()).unwrap();
+        let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  auth_file: {file}\n  base_url: https://upstream.invalid\n  routing:\n    account_fallback: selected\n    api_key_fallback: selected\n")).await;
+        trust(&running, &fixture, &endpoint);
+        let name = if bearer { "authorization" } else { "x-api-key" };
+        let value = if bearer {
+            "Bearer model-secret"
+        } else {
+            "model-secret"
+        };
+        let mut response = http()
+            .post(format!("{}/anthropic/v1/messages?beta=true", running.url))
+            .header(name, value)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "custom-beta")
+            .header("cookie", "private-cookie")
+            .header("chatgpt-account-id", "private-account")
+            .body(r#"{"model":"test-model","stream":true}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            fixture
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT upstream.invalid:443")
+        );
+        let request = fixture.requests.recv().await.unwrap();
+        assert!(request.starts_with("POST /v1/messages?beta=true HTTP/1.1"));
+        assert!(request.contains(&format!("{name}: {value}\r\n")));
+        assert!(!request.contains(if bearer {
+            "x-api-key:"
+        } else {
+            "authorization:"
+        }));
+        assert!(request.contains(if bearer {
+            "anthropic-beta: custom-beta,oauth-2025-04-20"
+        } else {
+            "anthropic-beta: custom-beta\r\n"
+        }));
+        assert!(!request.contains("private-cookie"));
+        assert!(!request.contains("private-account"));
+        assert!(request.ends_with(r#"{"model":"test-model","stream":true}"#));
+        assert_eq!(response.chunk().await.unwrap().unwrap(), "data: first\n\n");
+        fixture.release.notify_one();
+        assert_eq!(response.text().await.unwrap(), "data: last\n\n");
+        let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+        assert!(log.contains("claude"));
+        assert!(!log.contains("model-secret"));
+    }
+}
+
+#[tokio::test]
+async fn claude_third_party_explicit_url_streams_directly_without_oauth_lookup_or_fallback() {
+    for bearer in [false, true] {
+        let mut fixture = fixture("direct", "sse").await;
+        let running = running("claude:\n  account_auth_file_only: true\n  routing:\n    api_key:\n      'upstream.invalid': none\n").await;
+        trust(&running, &fixture, "none");
+        let mut response = http()
+            .post(format!(
+                "{}/https://upstream.invalid/v1/messages?beta=true",
+                running.url
+            ))
+            .header(
+                if bearer { "authorization" } else { "x-api-key" },
+                if bearer {
+                    "Bearer api-secret"
+                } else {
+                    "api-secret"
+                },
+            )
+            .body("model-body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let request = fixture.requests.recv().await.unwrap();
+        assert!(request.starts_with("POST /v1/messages?beta=true HTTP/1.1"));
+        assert!(request.ends_with("model-body"));
+        assert!(!request.contains("oauth-2025-04-20"));
+        assert_eq!(response.chunk().await.unwrap().unwrap(), "data: first\n\n");
+        fixture.release.notify_one();
+        assert_eq!(response.text().await.unwrap(), "data: last\n\n");
+        assert!(fixture.requests.try_recv().is_err());
+        assert!(running.server.claude_profiles.lock().unwrap().is_empty());
+    }
+    let mut fixture = fixture("direct", "redirect").await;
+    let running =
+        running("claude:\n  routing:\n    api_key:\n      'upstream.invalid': none\n").await;
+    trust(&running, &fixture, "none");
+    let response = http()
+        .get(format!(
+            "{}/https://upstream.invalid/v1/models",
+            running.url
+        ))
+        .bearer_auth("api-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 302);
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /v1/models HTTP/1.1")
+    );
+}
+
+#[tokio::test]
+async fn claude_usage_requires_saved_account_and_cannot_use_openai_fallback() {
+    let running = running("routing:\n  api_key_fallback: none\nclaude:\n  account_fallback: none\n  api_key_fallback: none\n").await;
+    for path in [
+        "/anthropic/api/oauth/usage",
+        "/anthropic/api/oauth/%75sage",
+        "/anthropic/api/oauth/usage/",
+        "/api/oauth/usage",
+        "/https://api.anthropic.com/api/oauth/usage",
+    ] {
+        let response = http()
+            .get(format!("{}{path}", running.url))
+            .bearer_auth("unmatched-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+    let running = self::running("routing:\n  api_key_fallback: none\n").await;
+    let response = http()
+        .post(format!("{}/v1/messages", running.url))
+        .bearer_auth("openai-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
+
+#[tokio::test]
+async fn claude_other_accounts_lookup_then_route_by_email_and_cache_per_token() {
+    let mut lookup = fixture("http", "sse").await;
+    let mut payload = fixture("http", "redirect").await;
+    let lookup_endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let payload_endpoint = format!("http://127.0.0.1:{}", payload.addr.port());
+    let running = running(&format!("proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nclaude:\n  account_auth_file_only: false\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: selected\n    account_fallback: lookup\n")).await;
+    trust(&running, &lookup, &lookup_endpoint);
+    trust(&running, &payload, &payload_endpoint);
+    for (token, expect_lookup) in [
+        ("first-secret", true),
+        ("first-secret", false),
+        ("second-secret", true),
+    ] {
+        let response = http()
+            .post(format!("{}/anthropic/v1/messages", running.url))
+            .bearer_auth(token)
+            .header("cookie", "private-cookie")
+            .header("anthropic-beta", "private-beta")
+            .body("private-payload")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 302);
+        if expect_lookup {
+            assert!(
+                lookup
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .starts_with("CONNECT upstream.invalid:443")
+            );
+            let request = lookup.requests.recv().await.unwrap();
+            assert!(request.starts_with("GET /api/oauth/profile HTTP/1.1"));
+            assert!(request.contains(&format!("authorization: Bearer {token}")));
+            assert!(!request.contains("private-cookie"));
+            assert!(!request.contains("private-beta"));
+            assert!(!request.contains("private-payload"));
+        }
+        assert!(lookup.requests.try_recv().is_err());
+        assert!(
+            payload
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT upstream.invalid:443")
+        );
+        assert!(
+            payload
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .ends_with("private-payload")
+        );
+    }
+    assert_eq!(running.server.claude_profiles.lock().unwrap().len(), 2);
+    running
+        .server
+        .claude_profiles
+        .lock()
+        .unwrap()
+        .get_mut("first-secret")
+        .unwrap()
+        .0 = Instant::now() - Duration::from_secs(301);
+    let response = http()
+        .post(format!("{}/anthropic/api/oauth/usage", running.url))
+        .bearer_auth("first-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 405); // A remotely identified account passes auth, then method validation.
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT ")
+    );
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /api/oauth/profile ")
+    );
+    assert!(payload.requests.try_recv().is_err());
+    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert!(log.contains("remote-account"));
+    assert!(!log.contains("first-secret"));
+    assert!(!log.contains("second-secret"));
+}
+
+#[tokio::test]
+async fn claude_profile_failures_never_forward_payload_or_cache_identity() {
+    for (mode, expected) in [
+        ("profile_unauthorized", 401),
+        ("profile_invalid", 502),
+        ("profile_redirect", 502),
+    ] {
+        let mut lookup = fixture("http", mode).await;
+        let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+        let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  account_auth_file_only: false\n  base_url: https://upstream.invalid\n  routing:\n    account_fallback: lookup\n")).await;
+        trust(&running, &lookup, &endpoint);
+        let response = http()
+            .post(format!("{}/anthropic/v1/messages", running.url))
+            .bearer_auth("secret")
+            .body("private-payload")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        assert!(
+            lookup
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT ")
+        );
+        let request = lookup.requests.recv().await.unwrap();
+        assert!(request.starts_with("GET /api/oauth/profile "));
+        assert!(!request.contains("private-payload"));
+        assert!(lookup.requests.try_recv().is_err());
+        assert!(running.server.claude_profiles.lock().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]

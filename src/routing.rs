@@ -22,7 +22,7 @@ pub fn codex_target(target: &str) -> &str {
 impl Config {
     pub fn resolve_url(&self, authorization: Option<&str>, target: &str) -> Result<Option<Route>> {
         let Some((base, proxy)) =
-            crate::url_routing::match_route(&self.routing.api_key, codex_target(target))?
+            crate::url_routing::match_route(&self.codex.routing.api_key, codex_target(target))?
         else {
             return Ok(None);
         };
@@ -39,30 +39,34 @@ impl Config {
             custom_upstream: true,
         }))
     }
+
     pub async fn resolve(&self, authorization: Option<&str>, fallback: bool) -> Result<Route> {
         let token = authorization
             .and_then(|s| s.strip_prefix("Bearer "))
             .filter(|s| valid_token(s))
             .ok_or(Error::new(401, "A configured Bearer token is required."))?;
         let mut unavailable = false;
-        let mut identity = None;
-        if !self.auth_file.is_empty() {
-            match Identity::read(&self.auth_file) {
-                Ok(i) if i.token == token => identity = Some(i),
+        let mut identities = Vec::new();
+        for (label, source) in &self.codex.accounts {
+            match source.codex_identity().await {
+                Ok(i) if i.token == token => identities.push((i, Some(label.as_str()))),
                 Ok(_) => {}
                 Err(_) => unavailable = true,
             }
         }
-        if identity.is_none()
-            && !self.account_auth_file_only
-            && (!self.routing.account.is_empty() || self.routing.account_fallback.is_some())
+        if identities.is_empty()
+            && !self.codex.account_auth_file_only
+            && (!self.codex.routing.account.is_empty()
+                || self.codex.routing.account_fallback.is_some())
         {
-            identity = Identity::from_token(token);
+            if let Some(i) = Identity::from_token(token) {
+                identities.push((i, None));
+            }
         }
         let mut matches = Vec::new();
-        for p in &self.providers {
+        for p in &self.codex.providers {
             match p
-                .credential(&self.base_url.api_key, identity.is_none())
+                .credential(&self.codex.base_url.api_key, identities.is_empty())
                 .await
             {
                 Ok((key, upstream)) if key == token => matches.push(Route {
@@ -77,20 +81,20 @@ impl Config {
                 Err(_) => unavailable = true,
             }
         }
-        if matches.len() + usize::from(identity.is_some()) > 1 {
+        if matches.len() + identities.len() > 1 {
             return Err(Error::new(
                 409,
                 "Bearer token matches multiple routes; configure distinct credentials.",
             ));
         }
-        if let Some(i) = identity {
-            let proxy = self.account_choice(&i)?;
+        if let Some((i, source)) = identities.pop() {
+            let proxy = self.account_choice(&i, source)?;
             return Ok(Route {
                 token: i.token,
                 account_id: Some(i.account_id),
                 provider: None,
                 proxy,
-                upstream: self.base_url.account.clone(),
+                upstream: self.codex.base_url.account.clone(),
                 custom_upstream: false,
             });
         }
@@ -98,13 +102,13 @@ impl Config {
             return Ok(r);
         }
         if fallback {
-            if let Some(proxy) = &self.routing.api_key_fallback {
+            if let Some(proxy) = &self.codex.routing.api_key_fallback {
                 return Ok(Route {
                     token: token.into(),
                     account_id: None,
                     provider: Some("openai-fallback".into()),
                     proxy: proxy.clone(),
-                    upstream: self.base_url.api_key.clone(),
+                    upstream: self.codex.base_url.api_key.clone(),
                     custom_upstream: false,
                 });
             }
@@ -229,7 +233,7 @@ mod tests {
     async fn explicit_url_routes_need_auth_but_no_local_key_source_or_fallback() {
         let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\nrouting:\n  api_key:\n    'api.invalid/v1': none\n").unwrap();
         config.check_credentials().await.unwrap();
-        assert!(config.providers.is_empty());
+        assert!(config.codex.providers.is_empty());
         for target in [
             "/https://api.invalid/v1/responses",
             "/codex/https://api.invalid/v1/responses",
@@ -260,6 +264,7 @@ mod tests {
                 .is_some()
         );
     }
+
     #[test]
     fn paths_and_origin_boundaries() {
         let b = "https://chatgpt.com/backend-api/codex";

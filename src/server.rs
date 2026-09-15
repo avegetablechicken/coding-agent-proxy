@@ -29,6 +29,7 @@ pub struct Server {
     pub config: Config,
     pub logger: Arc<Logger>,
     clients: Mutex<HashMap<String, reqwest::Client>>,
+    claude_profiles: Mutex<HashMap<String, (Instant, crate::claude::ClaudeIdentity)>>,
 }
 impl Server {
     pub fn new(config: Config, logger: Arc<Logger>) -> Self {
@@ -36,7 +37,91 @@ impl Server {
             config,
             logger,
             clients: Mutex::new(HashMap::new()),
+            claude_profiles: Mutex::new(HashMap::new()),
         }
+    }
+    async fn claude_route(
+        &self,
+        headers: &HeaderMap,
+        log: &mut RequestLog,
+    ) -> Result<crate::claude::ClaudeRoute> {
+        let mut route = self.config.claude.resolve(headers).await?;
+        if !route.needs_profile {
+            return Ok(route);
+        }
+        let cached = self
+            .claude_profiles
+            .lock()
+            .map_err(|_| Error::config("Claude profile cache unavailable."))?
+            .get(&route.token)
+            .filter(|(time, _)| time.elapsed() < Duration::from_secs(300))
+            .map(|(_, identity)| identity.clone());
+        let identity = if let Some(identity) = cached {
+            identity
+        } else {
+            // Before the token's identity is known, account_fallback provides
+            // the explicitly configured lookup transport. Never use a direct
+            // or cross-account proxy inferred from an unverified identity.
+            let url = self.config.claude.url("/api/oauth/profile")?;
+            let selected = self.select(&route.proxy, &url, log).await?;
+            let endpoint = self.config.endpoint(&selected);
+            log.field("service", "claude");
+            log.field("profile_proxy", &selected);
+            log.field("profile_proxy_endpoint", redacted_endpoint(endpoint));
+            let mut response = self
+                .client(endpoint)?
+                .get(url)
+                .bearer_auth(&route.token)
+                .header("accept", "application/json")
+                .header("accept-encoding", "identity")
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .timeout(Duration::from_secs_f64(
+                    self.config.request_timeout_seconds.min(10.0),
+                ))
+                .send()
+                .await
+                .map_err(|_| Error::config("Claude profile transport failed."))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(Error::new(
+                    if status.is_client_error() {
+                        status.as_u16()
+                    } else {
+                        502
+                    },
+                    "Claude profile lookup failed.",
+                ));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| Error::config("Claude profile read failed."))?
+            {
+                if bytes.len() + chunk.len() > 65536 {
+                    return Err(Error::config("Claude profile exceeds 64 KiB."));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|_| Error::config("Invalid Claude profile JSON."))?;
+            let identity = crate::claude::ClaudeIdentity::profile(&value)?;
+            let mut cache = self
+                .claude_profiles
+                .lock()
+                .map_err(|_| Error::config("Claude profile cache unavailable."))?;
+            cache.retain(|_, (time, _)| time.elapsed() < Duration::from_secs(300));
+            if cache.len() >= 128 {
+                cache.clear();
+            }
+            cache.insert(route.token.clone(), (Instant::now(), identity.clone()));
+            identity
+        };
+        self.config.claude.apply_profile(&mut route, identity)?;
+        Ok(route)
+    }
+    fn client(&self, endpoint: &str) -> Result<reqwest::Client> {
+        self.client_transport(endpoint, false)
     }
     fn client_transport(&self, endpoint: &str, native_tls: bool) -> Result<reqwest::Client> {
         let key = if native_tls {
@@ -87,6 +172,14 @@ impl Server {
         clients.insert(key, client.clone());
         Ok(client)
     }
+    async fn select(
+        &self,
+        choice: &Choice,
+        destination: &Url,
+        log: &mut RequestLog,
+    ) -> Result<String> {
+        self.select_transport(choice, destination, log, false).await
+    }
     async fn select_transport(
         &self,
         choice: &Choice,
@@ -129,26 +222,31 @@ impl Server {
         ))
     }
     pub async fn startup_log(&self) {
-        if !self.config.auth_file.is_empty() {
-            match crate::identity::Identity::read(&self.config.auth_file)
-                .and_then(|i| self.config.account_choice(&i).map(|p| (i, p)))
+        for (label, source) in &self.config.codex.accounts {
+            match source
+                .codex_identity()
+                .await
+                .and_then(|i| self.config.account_choice(&i, Some(label)).map(|p| (i, p)))
             {
                 Ok((i, p)) => self.logger.write(
                     "current_route",
-                    json!({"account_id":i.account_id,"proxy":p.label()})
+                    json!({"service":"codex", "account_id":i.account_id,"proxy":p.label()})
                         .as_object()
                         .unwrap()
                         .clone(),
                 ),
                 Err(e) => self.logger.write(
                     "route_unavailable",
-                    json!({"reason":e.message}).as_object().unwrap().clone(),
+                    json!({"service":"codex", "reason":e.message})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
                 ),
             }
         }
-        for p in &self.config.providers {
+        for p in &self.config.codex.providers {
             let event = if p
-                .credential(&self.config.base_url.api_key, true)
+                .credential(&self.config.codex.base_url.api_key, true)
                 .await
                 .is_ok()
             {
@@ -162,6 +260,17 @@ impl Server {
                     .as_object()
                     .unwrap()
                     .clone(),
+            );
+        }
+        if !self.config.claude.accounts.is_empty() || !self.config.claude.routing.api_key.is_empty()
+        {
+            self.logger.write(
+                if self.config.claude.check_credentials().await.is_ok() {
+                    "current_route"
+                } else {
+                    "route_unavailable"
+                },
+                json!({"service": "claude"}).as_object().unwrap().clone(),
             );
         }
     }
@@ -267,9 +376,58 @@ impl Server {
                 "Only origin-form HTTP request targets are supported.",
             ));
         }
+        let codex_scoped = target.starts_with("/codex/https://");
+        let claude_scoped = target.starts_with("/anthropic/") || target.starts_with("/claude/");
         let target = crate::routing::codex_target(target);
         let path = target.split('?').next().unwrap_or("");
         let docs = path == MCP_PATH;
+        let explicit_api_route = if codex_scoped {
+            None
+        } else {
+            self.config
+                .claude
+                .explicit_api_route(incoming.headers(), target)?
+        };
+        let codex_url_match = !claude_scoped
+            && crate::url_routing::match_route(&self.config.codex.routing.api_key, target)?
+                .is_some();
+        if codex_url_match && explicit_api_route.is_some() {
+            return Err(Error::new(
+                409,
+                "API upstream is configured for both apps; use /codex/https:// or /anthropic/https://.",
+            ));
+        }
+        let explicit_codex_route = if codex_url_match {
+            self.config.resolve_url(
+                incoming
+                    .headers()
+                    .get("authorization")
+                    .and_then(|h| h.to_str().ok()),
+                target,
+            )?
+        } else {
+            None
+        };
+        let claude_target = if codex_scoped || explicit_codex_route.is_some() {
+            None
+        } else {
+            crate::claude::target(target).or_else(|| explicit_api_route.as_ref().map(|_| target))
+        };
+        if let Some(claude_target) = claude_target {
+            if explicit_api_route.is_none() {
+                // Reject undeclared destinations before an OAuth profile lookup.
+                self.config.claude.url(claude_target)?;
+            }
+        }
+        let claude_route = if claude_target.is_some() {
+            Some(if let Some(route) = explicit_api_route {
+                route
+            } else {
+                self.claude_route(incoming.headers(), log).await?
+            })
+        } else {
+            None
+        };
         let query = account_query(target);
         let auth = incoming
             .headers()
@@ -279,7 +437,14 @@ impl Server {
             .headers()
             .get("chatgpt-account-id")
             .and_then(|h| h.to_str().ok());
-        let (route, choice) = if docs {
+        let (route, choice) = if let Some(r) = &claude_route {
+            log.field("service", "claude");
+            log.field("provider", &r.label);
+            if let Some(identity) = &r.identity {
+                log.field("account_id", &identity.account_id);
+            }
+            (None, r.proxy.clone())
+        } else if docs {
             match self.config.resolve(auth, false).await {
                 Ok(r) if account.is_none() || account == r.account_id.as_deref() => {
                     let p = r.proxy.clone();
@@ -288,6 +453,7 @@ impl Server {
                 _ => (
                     None,
                     self.config
+                        .codex
                         .routing
                         .mcp_fallback
                         .clone()
@@ -295,9 +461,11 @@ impl Server {
                 ),
             }
         } else {
-            let r = match self.config.resolve_url(auth, target)? {
-                Some(route) => route,
-                None => self.config.resolve(auth, true).await?,
+            let r = if let Some(route) = explicit_codex_route {
+                log.field("service", "codex");
+                route
+            } else {
+                self.config.resolve(auth, true).await?
             };
             if r.account_id.is_some() && account.is_some() && account != r.account_id.as_deref() {
                 return Err(Error::new(
@@ -322,7 +490,27 @@ impl Server {
         if docs && !matches!(incoming.method().as_str(), "GET" | "POST" | "DELETE") {
             return Err(Error::new(405, "MCP supports GET, POST and DELETE."));
         }
-        let url = if docs {
+        let url = if let Some(claude_target) = claude_target {
+            let url = claude_route.as_ref().unwrap().url(claude_target)?;
+            let decoded_path = percent_encoding::percent_decode_str(url.path())
+                .decode_utf8()
+                .map_err(|_| Error::new(400, "Invalid Claude request path."))?;
+            if decoded_path
+                .trim_end_matches('/')
+                .ends_with("/api/oauth/usage")
+            {
+                if !claude_route.as_ref().unwrap().matched_account {
+                    return Err(Error::new(
+                        403,
+                        "Claude usage requires a matched OAuth account.",
+                    ));
+                }
+                if incoming.method() != "GET" {
+                    return Err(Error::new(405, "Claude usage supports GET only."));
+                }
+            }
+            url
+        } else if docs {
             if target.contains('#') {
                 return Err(Error::config("Invalid MCP request target."));
             }
@@ -369,7 +557,8 @@ impl Server {
             }
         })?
         .to_bytes();
-        let native_tls = route.as_ref().is_some_and(|r| r.custom_upstream);
+        let native_tls = claude_route.as_ref().is_some_and(|r| r.custom_upstream)
+            || route.as_ref().is_some_and(|r| r.custom_upstream);
         let selected = self
             .select_transport(&choice, &url, log, native_tls)
             .await?;
@@ -395,7 +584,9 @@ impl Server {
                 headers.remove(n);
             }
         }
-        if !docs {
+        if let Some(r) = claude_route {
+            r.headers(&mut headers)?;
+        } else if !docs {
             let r = route.unwrap();
             headers.insert(
                 "authorization",

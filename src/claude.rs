@@ -1,0 +1,890 @@
+//! Native Anthropic forwarding, isolated from Codex credential discovery.
+use crate::{
+    Error, Result,
+    config::{
+        AccountSource, Choice, Config, Routing, expand, normalize_auth, validate_env,
+        validate_upstream,
+    },
+    identity::{environment_key, environment_key_with_shell, valid_token},
+};
+use hyper::HeaderMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
+use url::Url;
+
+fn default_base() -> String {
+    "https://api.anthropic.com".into()
+}
+fn file_only() -> bool {
+    true
+}
+#[derive(Clone, Serialize)]
+pub struct Claude {
+    pub account_auth_file_only: bool,
+    pub base_url: String,
+    pub accounts: BTreeMap<String, AccountSource>,
+    pub routing: Routing,
+}
+impl Default for Claude {
+    fn default() -> Self {
+        Self {
+            account_auth_file_only: true,
+            base_url: default_base(),
+            accounts: BTreeMap::new(),
+            routing: Routing::default(),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for Claude {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut value = serde_yaml_ng::Value::deserialize(deserializer)?;
+        let map = value
+            .as_mapping_mut()
+            .ok_or_else(|| D::Error::custom("Claude settings must be a mapping."))?;
+        let has_routing = map.contains_key("routing");
+        let legacy_keys = ["api_key", "account_fallback", "api_key_fallback"];
+        let inline_proxy = map
+            .get("accounts")
+            .and_then(|v| v.as_mapping())
+            .is_some_and(|m| m.values().any(|v| v.get("proxy").is_some()));
+        if has_routing && (inline_proxy || legacy_keys.iter().any(|k| map.contains_key(*k))) {
+            return Err(D::Error::custom(
+                "Do not mix Claude routing with legacy inline proxy settings.",
+            ));
+        }
+        if let Some(base) = map.get_mut("base_url") {
+            if base.is_mapping() {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct LegacyBases {
+                    #[serde(default = "default_base")]
+                    account: String,
+                    #[serde(default = "default_base")]
+                    api_key: String,
+                }
+                let old: LegacyBases =
+                    serde_yaml_ng::from_value(base.clone()).map_err(D::Error::custom)?;
+                if old.account != old.api_key {
+                    return Err(D::Error::custom(
+                        "Claude uses one base_url; differing legacy account/API Key bases require choosing one upstream.",
+                    ));
+                }
+                *base = old.account.into();
+            }
+        }
+        if !has_routing {
+            let mut routing = serde_yaml_ng::Mapping::new();
+            for key in legacy_keys {
+                if let Some(value) = map.remove(key) {
+                    routing.insert(key.into(), value);
+                }
+            }
+            let mut accounts = serde_yaml_ng::Mapping::new();
+            if let Some(sources) = map.get_mut("accounts").and_then(|v| v.as_mapping_mut()) {
+                for (label, source) in sources {
+                    if let Some(proxy) = source.as_mapping_mut().and_then(|v| v.remove("proxy")) {
+                        accounts.insert(label.clone(), proxy);
+                    }
+                }
+            }
+            routing.insert("account".into(), serde_yaml_ng::Value::Mapping(accounts));
+            map.insert("routing".into(), serde_yaml_ng::Value::Mapping(routing));
+        }
+        normalize_auth(&mut value).map_err(D::Error::custom)?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Normalized {
+            #[serde(default = "file_only")]
+            account_auth_file_only: bool,
+            #[serde(default = "default_base")]
+            base_url: String,
+            #[serde(default)]
+            accounts: BTreeMap<String, AccountSource>,
+            routing: Routing,
+        }
+        let n: Normalized = serde_yaml_ng::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self {
+            account_auth_file_only: n.account_auth_file_only,
+            base_url: n.base_url,
+            accounts: n.accounts,
+            routing: n.routing,
+        })
+    }
+}
+impl AccountSource {
+    fn claude_credential_path(&self) -> std::path::PathBuf {
+        self.auth_file
+            .as_ref()
+            .map(|s| expand(s))
+            .unwrap_or_else(|| {
+                std::env::var_os("CLAUDE_CONFIG_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| expand("~/.claude"))
+                    .join(".credentials.json")
+            })
+    }
+    fn claude_identity(&self) -> Option<ClaudeIdentity> {
+        // An environment token is not evidence that it belongs to the local
+        // CLI metadata. Such configured sources retain label/fallback routing.
+        if self.auth_env.is_some() {
+            return None;
+        }
+        let path = self.claude_credential_path();
+        let directory = path.parent()?;
+        let metadata = if directory == expand("~/.claude") {
+            expand("~/.claude.json")
+        } else {
+            directory.join(".claude.json")
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(metadata).ok()?).ok()?;
+        ClaudeIdentity::local(&value["oauthAccount"])
+    }
+    async fn claude_token(&self) -> Result<String> {
+        if let Some(name) = &self.auth_env {
+            return environment_key(name).await;
+        }
+        let path = self.claude_credential_path();
+        let raw = std::fs::read(path)
+            .map_err(|_| Error::config("Cannot read Claude credentials file."))?;
+        let value: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|_| Error::config("Invalid Claude credentials file."))?;
+        value["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .filter(|s| valid_token(s))
+            .map(String::from)
+            .ok_or(Error::config(
+                "Claude credentials require claudeAiOauth.accessToken.",
+            ))
+    }
+}
+
+#[derive(Clone)]
+pub struct ClaudeIdentity {
+    pub account_id: String,
+    pub usernames: Vec<String>,
+}
+impl ClaudeIdentity {
+    fn parse(value: &serde_json::Value, id: &str, fields: &[&str]) -> Option<Self> {
+        Some(Self {
+            account_id: value[id].as_str().filter(|s| valid_token(s))?.into(),
+            usernames: fields
+                .iter()
+                .filter_map(|key| value[*key].as_str())
+                .filter(|s| !s.trim().is_empty() && !s.chars().any(char::is_control))
+                .map(String::from)
+                .collect(),
+        })
+    }
+    fn local(value: &serde_json::Value) -> Option<Self> {
+        Self::parse(
+            value,
+            "accountUuid",
+            &["emailAddress", "displayName", "fullName"],
+        )
+    }
+    pub(crate) fn profile(value: &serde_json::Value) -> Result<Self> {
+        Self::parse(
+            &value["account"],
+            "uuid",
+            &["email", "display_name", "full_name"],
+        )
+        .ok_or(Error::config("Claude profile is missing account identity."))
+    }
+}
+
+pub struct ClaudeRoute {
+    pub token: String,
+    pub bearer: bool,
+    pub matched_account: bool,
+    pub label: String,
+    pub proxy: Choice,
+    pub identity: Option<ClaudeIdentity>,
+    pub needs_profile: bool,
+    pub upstream: String,
+    pub oauth: bool,
+    pub custom_upstream: bool,
+}
+
+/// The namespace covers every Claude Code endpoint. Unprefixed Messages and
+/// OAuth endpoints also work; ambiguous endpoints such as /v1/models use /anthropic.
+pub fn target(target: &str) -> Option<&str> {
+    for prefix in ["/anthropic", "/claude"] {
+        if target
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+        {
+            return target.strip_prefix(prefix);
+        }
+    }
+    let path = target.split('?').next().unwrap_or("");
+    let path = if path.starts_with("/https://") {
+        Url::parse(&path[1..]).ok()?.path().to_owned()
+    } else {
+        path.to_owned()
+    };
+    (path == "/v1/messages" || path.starts_with("/v1/messages/") || path.starts_with("/api/oauth/"))
+        .then_some(target)
+}
+
+impl Claude {
+    pub(crate) fn validate(&self, config: &Config) -> Result<()> {
+        validate_upstream(&self.base_url)?;
+        if self.routing.mcp_fallback.is_some() {
+            return Err(Error::config(
+                "mcp_fallback is only supported under codex.routing.",
+            ));
+        }
+        for (label, account) in &self.accounts {
+            if label.trim().is_empty() {
+                return Err(Error::config("Empty Claude account label."));
+            }
+            account.validate()?;
+        }
+        if self.account_auth_file_only
+            && self.accounts.is_empty()
+            && !self.routing.account.is_empty()
+        {
+            return Err(Error::config(
+                "Claude file-only account routing requires an auth_file or auth_env.",
+            ));
+        }
+        for (label, choice) in &self.routing.account {
+            if label.trim().is_empty() {
+                return Err(Error::config("Empty Claude routing identifier."));
+            }
+            config.validate_choice(choice)?;
+        }
+        for (name, choice) in &self.routing.api_key {
+            if crate::url_routing::is_url_selector(name) {
+                crate::claude_api::validate_api_upstream(name)?;
+            } else {
+                validate_env(name)?;
+            }
+            config.validate_choice(choice)?;
+        }
+        crate::url_routing::validate_routes(&self.routing.api_key)?;
+        for choice in [
+            &self.routing.account_fallback,
+            &self.routing.api_key_fallback,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            config.validate_choice(choice)?;
+        }
+        Ok(())
+    }
+
+    pub async fn check_credentials(&self) -> Result<()> {
+        let mut keys = HashSet::new();
+        if self.account_auth_file_only {
+            for (label, account) in &self.accounts {
+                self.account_choice(account.claude_identity().as_ref(), Some(label))?;
+                if !keys.insert(account.claude_token().await?) {
+                    return Err(Error::config(
+                        "Multiple Claude routes have the same credential.",
+                    ));
+                }
+            }
+        }
+        for name in self
+            .routing
+            .api_key
+            .keys()
+            .filter(|s| !crate::url_routing::is_url_selector(s))
+        {
+            if !keys.insert(environment_key(name).await?) {
+                return Err(Error::config(
+                    "Multiple Claude routes have the same credential.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn resolve(&self, headers: &HeaderMap) -> Result<ClaudeRoute> {
+        let auth = headers.get("authorization");
+        let key = headers.get("x-api-key");
+        if auth.is_some() && key.is_some() {
+            return Err(Error::new(
+                400,
+                "Supply only one Claude authentication header.",
+            ));
+        }
+        let bearer = auth.is_some();
+        let token = if bearer {
+            auth.and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        } else {
+            key.and_then(|v| v.to_str().ok())
+        }
+        .filter(|s| valid_token(s))
+        .ok_or(Error::new(
+            401,
+            "Claude requires x-api-key or Bearer authentication.",
+        ))?;
+        let mut matches = Vec::new();
+        let mut identity = None;
+        let mut unavailable = false;
+        let mut matched_account = false;
+        if bearer {
+            let mut sources = Vec::new();
+            for (label, account) in &self.accounts {
+                match account.claude_token().await {
+                    Ok(value) if value == token => sources.push((label, account)),
+                    Ok(_) => {}
+                    Err(_) => unavailable = true,
+                }
+            }
+            if sources.len() > 1 {
+                return Err(Error::new(
+                    409,
+                    "Claude credential matches multiple routes.",
+                ));
+            }
+            if let Some((label, account)) = sources.pop() {
+                matched_account = true;
+                identity = account.claude_identity();
+                matches.push((label, self.account_choice(identity.as_ref(), Some(label))?));
+            }
+        }
+        for (name, proxy) in self
+            .routing
+            .api_key
+            .iter()
+            .filter(|(s, _)| !crate::url_routing::is_url_selector(s))
+        {
+            match environment_key_with_shell(name, !matched_account).await {
+                Ok(value) if value == token => matches.push((name, proxy.clone())),
+                Ok(_) => {}
+                Err(_) => unavailable = true,
+            }
+        }
+        if matches.len() > 1 {
+            return Err(Error::new(
+                409,
+                "Claude credential matches multiple routes.",
+            ));
+        }
+        let matched_api = !matched_account && !matches.is_empty();
+        if bearer && !matched_account && !matched_api && self.account_auth_file_only {
+            if unavailable {
+                return Err(Error::config(
+                    "No matching Claude route; credential source unavailable.",
+                ));
+            }
+            return Err(Error::new(
+                401,
+                "Claude token does not match a saved account credential.",
+            ));
+        }
+        let needs_profile = bearer && !matched_account && !matched_api;
+        if needs_profile && self.routing.account_fallback.is_none() {
+            return Err(Error::config(
+                "Claude profile lookup requires routing.account_fallback.",
+            ));
+        }
+        let (label, proxy) = if let Some((label, proxy)) = matches.pop() {
+            (label.clone(), proxy.clone())
+        } else if let Some(proxy) = if bearer {
+            &self.routing.account_fallback
+        } else {
+            &self.routing.api_key_fallback
+        } {
+            (
+                if bearer {
+                    "claude-account-fallback"
+                } else {
+                    "claude-api-key-fallback"
+                }
+                .into(),
+                proxy.clone(),
+            )
+        } else if unavailable {
+            return Err(Error::config(
+                "No matching Claude route; credential source unavailable.",
+            ));
+        } else {
+            return Err(Error::new(
+                401,
+                "Claude credential does not match a configured route.",
+            ));
+        };
+        Ok(ClaudeRoute {
+            token: token.into(),
+            bearer,
+            matched_account,
+            label,
+            proxy,
+            identity,
+            needs_profile,
+            upstream: self.base_url.clone(),
+            oauth: bearer && !matched_api,
+            custom_upstream: false,
+        })
+    }
+
+    pub(crate) fn explicit_api_route(
+        &self,
+        headers: &HeaderMap,
+        target: &str,
+    ) -> Result<Option<ClaudeRoute>> {
+        let Some(explicit) = crate::claude_api::explicit_target(target) else {
+            return Ok(None);
+        };
+        let Some((base, proxy)) = crate::url_routing::match_route(&self.routing.api_key, explicit)?
+        else {
+            return Ok(None);
+        };
+        let auth = headers.get("authorization");
+        let key = headers.get("x-api-key");
+        if auth.is_some() && key.is_some() {
+            return Err(Error::new(
+                400,
+                "Supply only one Claude authentication header.",
+            ));
+        }
+        let bearer = auth.is_some();
+        let token = if bearer {
+            auth.and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        } else {
+            key.and_then(|v| v.to_str().ok())
+        }
+        .filter(|s| valid_token(s))
+        .ok_or(Error::new(
+            401,
+            "Claude API requires x-api-key or Bearer authentication.",
+        ))?;
+        Ok(Some(ClaudeRoute {
+            token: token.into(),
+            bearer,
+            matched_account: false,
+            label: base.into(),
+            proxy: proxy.clone(),
+            identity: None,
+            needs_profile: false,
+            upstream: crate::url_routing::validate_upstream(base)?.into(),
+            oauth: false,
+            custom_upstream: true,
+        }))
+    }
+
+    fn account_choice(
+        &self,
+        identity: Option<&ClaudeIdentity>,
+        label: Option<&str>,
+    ) -> Result<Choice> {
+        let by_identity = identity.and_then(|i| {
+            self.routing
+                .account
+                .get(&i.account_id)
+                .or_else(|| i.usernames.iter().find_map(|u| self.routing.account.get(u)))
+        });
+        by_identity
+            .or_else(|| label.and_then(|s| self.routing.account.get(s)))
+            .or(self.routing.account_fallback.as_ref())
+            .cloned()
+            .ok_or(Error::config("Claude account has no proxy route."))
+    }
+    pub(crate) fn apply_profile(
+        &self,
+        route: &mut ClaudeRoute,
+        identity: ClaudeIdentity,
+    ) -> Result<()> {
+        route.proxy = self.account_choice(Some(&identity), None)?;
+        route.label = "claude-account".into();
+        route.identity = Some(identity);
+        route.needs_profile = false;
+        route.matched_account = true;
+        Ok(())
+    }
+    pub fn url(&self, target: &str) -> Result<Url> {
+        api_url(&self.base_url, target)
+    }
+}
+fn api_url(base: &str, target: &str) -> Result<Url> {
+    if !target.starts_with('/') || target.starts_with("//") {
+        return Err(Error::config("Invalid Claude request target."));
+    }
+    // Reuse origin/path validation without OpenAI's /v1 stripping.
+    if target.starts_with("/https://") || target.starts_with("/http://") {
+        return crate::routing::upstream_url(base, target, false);
+    }
+    let explicit = format!("/{}{target}", base.trim_end_matches('/'));
+    crate::routing::upstream_url(base, &explicit, false)
+}
+
+impl ClaudeRoute {
+    pub fn url(&self, target: &str) -> Result<Url> {
+        api_url(&self.upstream, target)
+    }
+    pub fn headers(&self, headers: &mut HeaderMap) -> Result<()> {
+        let (name, value) = if self.bearer {
+            ("authorization", format!("Bearer {}", self.token))
+        } else {
+            ("x-api-key", self.token.clone())
+        };
+        headers.insert(
+            name,
+            value
+                .parse()
+                .map_err(|_| Error::new(401, "Invalid Claude credential."))?,
+        );
+        if !headers.contains_key("anthropic-version") {
+            headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        }
+        if self.oauth {
+            let existing = headers
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !existing.split(',').any(|v| v.trim() == "oauth-2025-04-20") {
+                let beta = if existing.is_empty() {
+                    "oauth-2025-04-20".into()
+                } else {
+                    format!("{existing},oauth-2025-04-20")
+                };
+                headers.insert(
+                    "anthropic-beta",
+                    beta.parse()
+                        .map_err(|_| Error::new(400, "Invalid Claude beta header."))?,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(extra: &str) -> Config {
+        Config::parse(&format!(
+            "listen_port: 7889\nrequest_timeout_seconds: 3\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn paths_keep_version_queries_and_origin_boundaries() {
+        let c = Claude::default();
+        for path in [
+            "/v1/messages?beta=true",
+            "/v1/messages/count_tokens",
+            "/api/oauth/usage",
+            "/v1/models",
+        ] {
+            for prefix in ["/anthropic", "/claude"] {
+                let prefixed = format!("{prefix}{path}");
+                assert_eq!(target(&prefixed), Some(path));
+                assert_eq!(
+                    c.url(target(&prefixed).unwrap()).unwrap().as_str(),
+                    format!("https://api.anthropic.com{path}")
+                );
+            }
+        }
+        assert!(target("/v1/responses").is_none());
+        assert!(target("/v1/models").is_none());
+        assert!(target("/claude-evil/v1/messages").is_none());
+        assert!(target("/anthropic-evil/v1/messages").is_none());
+        assert_eq!(
+            target("/v1/messages?beta=true"),
+            Some("/v1/messages?beta=true")
+        );
+        for path in [
+            "//evil.invalid/v1/messages",
+            "/https://evil.invalid/v1/messages",
+            "/https://api.anthropic.com.evil.invalid/v1/messages",
+            "/%2e%2e/secret",
+            "/x%5cy",
+            "/v1/messages#fragment",
+        ] {
+            assert!(c.url(path).is_err(), "{path}");
+        }
+        assert_eq!(
+            c.url("/https://api.anthropic.com/v1/messages?beta=true")
+                .unwrap()
+                .as_str(),
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn accounts_reload_and_reject_duplicates_and_wrong_header_types() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        let write = |token: &str| {
+            std::fs::write(&path, serde_json::json!({"claudeAiOauth":{"accessToken":token,"refreshToken":"never-forward"}}).to_string()).unwrap()
+        };
+        write("first-secret");
+        let mut c = config("").claude;
+        c.accounts.insert(
+            "personal".into(),
+            AccountSource {
+                auth_file: Some(path.to_string_lossy().into()),
+                auth_env: None,
+            },
+        );
+        c.routing
+            .account
+            .insert("personal".into(), Choice::One("selected".into()));
+        c.routing
+            .account
+            .insert("duplicate".into(), Choice::One("selected".into()));
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer first-secret".parse().unwrap());
+        let r = c.resolve(&h).await.unwrap();
+        assert!(r.matched_account);
+        assert_eq!(r.proxy.label(), "selected");
+        assert_eq!(r.label, "personal");
+        write("second-secret");
+        assert_eq!(c.resolve(&h).await.err().unwrap().status, 401);
+        h.insert("authorization", "Bearer second-secret".parse().unwrap());
+        assert!(c.resolve(&h).await.is_ok());
+        c.accounts
+            .insert("duplicate".into(), c.accounts["personal"].clone());
+        assert_eq!(c.resolve(&h).await.err().unwrap().status, 409);
+        assert!(c.check_credentials().await.is_err());
+        h.insert("x-api-key", "second-secret".parse().unwrap());
+        assert_eq!(c.resolve(&h).await.err().unwrap().status, 400);
+        h.remove("authorization");
+        assert_eq!(c.resolve(&h).await.err().unwrap().status, 401);
+    }
+
+    #[tokio::test]
+    async fn fallbacks_require_valid_auth_and_preserve_header_type_and_betas() {
+        let c = config("claude:\n  account_auth_file_only: false\n  account_fallback: none\n  api_key_fallback: none\n").claude;
+        for bearer in [false, true] {
+            let mut h = HeaderMap::new();
+            let name = if bearer { "authorization" } else { "x-api-key" };
+            h.insert(
+                name,
+                if bearer {
+                    "Bearer model-secret"
+                } else {
+                    "model-secret"
+                }
+                .parse()
+                .unwrap(),
+            );
+            let r = c.resolve(&h).await.unwrap();
+            assert!(!r.matched_account);
+            let mut forwarded = crate::server::filtered_headers(&h);
+            forwarded.insert("anthropic-beta", "custom-beta".parse().unwrap());
+            r.headers(&mut forwarded).unwrap();
+            assert_eq!(forwarded[name], h[name]);
+            assert_eq!(forwarded["anthropic-version"], "2023-06-01");
+            assert_eq!(
+                forwarded["anthropic-beta"],
+                if bearer {
+                    "custom-beta,oauth-2025-04-20"
+                } else {
+                    "custom-beta"
+                }
+            );
+            r.headers(&mut forwarded).unwrap();
+            assert_eq!(
+                forwarded["anthropic-beta"]
+                    .to_str()
+                    .unwrap()
+                    .matches("oauth-2025-04-20")
+                    .count(),
+                usize::from(bearer)
+            );
+        }
+        for value in ["", "Basic abc", "Bearer ", "Bearer two tokens"] {
+            let mut h = HeaderMap::new();
+            h.insert("authorization", value.parse().unwrap());
+            assert_eq!(c.resolve(&h).await.err().unwrap().status, 401);
+        }
+        assert_eq!(
+            c.resolve(&HeaderMap::new()).await.err().unwrap().status,
+            401
+        );
+    }
+
+    #[test]
+    fn configuration_validates_sources_and_preserves_migration() {
+        for extra in [
+            "api_key:\n    BAD-NAME: none",
+            "account_fallback: []",
+            "api_key_fallback: absent",
+            "base_url: http://api.anthropic.com",
+            "accounts:\n    local:\n      auth_env: TOKEN\n      auth_file: file\n      proxy: none",
+            "accounts:\n    local:\n      auth_file: ''\n      proxy: none",
+        ] {
+            assert!(
+                Config::parse(&format!(
+                    "listen_port: 7889\nrequest_timeout_seconds: 3\nclaude:\n  {extra}\n"
+                ))
+                .is_err(),
+                "{extra}"
+            );
+        }
+        let c = config(
+            "claude:\n  accounts:\n    local:\n      proxy: none\n  api_key:\n    ANTHROPIC_API_KEY: none\n  account_fallback: [none]\n",
+        );
+        let roundtrip = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
+        assert!(roundtrip.claude.accounts.contains_key("local"));
+        assert!(
+            roundtrip
+                .claude
+                .routing
+                .api_key
+                .contains_key("ANTHROPIC_API_KEY")
+        );
+        assert!(roundtrip.claude.routing.account_fallback.is_some());
+        assert_eq!(roundtrip.claude.routing.account["local"].label(), "none");
+        assert_eq!(roundtrip.claude.base_url, "https://api.anthropic.com");
+        assert_eq!(roundtrip.claude.base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn claude_has_one_base_and_rejects_conflicting_legacy_bases() {
+        let c = config("claude:\n  base_url: https://gateway.invalid/api\n  routing:\n    account_fallback: none\n    api_key_fallback: none\n").claude;
+        assert_eq!(
+            c.url("/v1/messages?beta=true").unwrap().as_str(),
+            "https://gateway.invalid/api/v1/messages?beta=true"
+        );
+        assert!(Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\nclaude:\n  base_url:\n    account: https://account.invalid\n    api_key: https://keys.invalid\n").is_err());
+    }
+
+    #[test]
+    fn explicit_api_upstreams_use_the_declared_route_and_keep_api_auth_separate_from_oauth() {
+        let c = config("proxies:\n  selected: http://127.0.0.1:7893\nclaude:\n  routing:\n    api_key:\n      'https://182.92.106.196:6060': none\n      'https://gateway.invalid/api': selected\n      'https://gateway.invalid/api/specific': none\n").claude;
+        for bearer in [false, true] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                if bearer { "authorization" } else { "x-api-key" },
+                if bearer {
+                    "Bearer api-secret"
+                } else {
+                    "api-secret"
+                }
+                .parse()
+                .unwrap(),
+            );
+            for path in [
+                "/https://182.92.106.196:6060/v1/models",
+                "/anthropic/https://182.92.106.196:6060/v1/messages",
+            ] {
+                let route = c.explicit_api_route(&headers, path).unwrap().unwrap();
+                assert_eq!(route.proxy.label(), "none");
+                assert!(!route.oauth && !route.needs_profile && !route.matched_account);
+                let mut forwarded = crate::server::filtered_headers(&headers);
+                route.headers(&mut forwarded).unwrap();
+                assert!(!forwarded.contains_key("anthropic-beta"));
+                assert_eq!(
+                    forwarded[if bearer { "authorization" } else { "x-api-key" }],
+                    headers[if bearer { "authorization" } else { "x-api-key" }]
+                );
+            }
+            assert_eq!(
+                c.explicit_api_route(
+                    &headers,
+                    "/https://gateway.invalid/api/specific/v1/messages"
+                )
+                .unwrap()
+                .unwrap()
+                .proxy
+                .label(),
+                "none"
+            );
+            assert_eq!(
+                c.explicit_api_route(&headers, "/https://gateway.invalid/api/v1/messages")
+                    .unwrap()
+                    .unwrap()
+                    .proxy
+                    .label(),
+                "selected"
+            );
+            for path in [
+                "/https://182.92.106.196:6061/v1/messages",
+                "/https://evil.invalid/v1/messages",
+                "/https://gateway.invalid/api-evil/v1/messages",
+            ] {
+                assert!(c.explicit_api_route(&headers, path).unwrap().is_none());
+            }
+            assert!(
+                c.explicit_api_route(&headers, "/https://182.92.106.196:6060/%2e%2e/secret")
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            c.explicit_api_route(
+                &HeaderMap::new(),
+                "/https://182.92.106.196:6060/v1/messages"
+            )
+            .err()
+            .unwrap()
+            .status,
+            401
+        );
+    }
+
+    #[tokio::test]
+    async fn file_only_identity_uses_local_metadata_and_reloads_without_leaking_to_other_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join(".credentials.json");
+        let metadata = dir.path().join(".claude.json");
+        std::fs::write(
+            &credentials,
+            r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+        )
+        .unwrap();
+        std::fs::write(&metadata, r#"{"oauthAccount":{"accountUuid":"local-id","emailAddress":"local@example.invalid","displayName":"Local"}}"#).unwrap();
+        let mut c = config(&format!("claude:\n  auth_file: {}\n  routing:\n    account:\n      local-id: none\n      local@example.invalid: none\n    account_fallback: none\n", serde_json::to_string(&credentials.to_string_lossy()).unwrap())).claude;
+        c.routing
+            .account
+            .insert("local-id".into(), Choice::One("uuid-route".into()));
+        c.routing.account.insert(
+            "local@example.invalid".into(),
+            Choice::One("email-route".into()),
+        );
+        c.routing.account_fallback = Some(Choice::One("bootstrap".into()));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer saved-secret".parse().unwrap());
+        let route = c.resolve(&headers).await.unwrap();
+        assert_eq!(route.proxy.label(), "uuid-route");
+        assert_eq!(route.identity.unwrap().account_id, "local-id");
+        assert!(!route.needs_profile);
+        c.routing.account.remove("local-id");
+        assert_eq!(
+            c.resolve(&headers).await.unwrap().proxy.label(),
+            "email-route"
+        );
+        std::fs::write(
+            &metadata,
+            r#"{"oauthAccount":{"accountUuid":"new-id","emailAddress":"new@example.invalid"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.resolve(&headers)
+                .await
+                .unwrap()
+                .identity
+                .unwrap()
+                .account_id,
+            "new-id"
+        );
+        headers.insert("authorization", "Bearer other-secret".parse().unwrap());
+        assert_eq!(c.resolve(&headers).await.err().unwrap().status, 401);
+        c.account_auth_file_only = false;
+        let route = c.resolve(&headers).await.unwrap();
+        assert!(route.identity.is_none());
+        assert!(route.needs_profile);
+        assert_eq!(route.proxy.label(), "bootstrap");
+        c.routing.account_fallback = None;
+        assert_eq!(c.resolve(&headers).await.err().unwrap().status, 502);
+        std::fs::remove_file(&credentials).unwrap();
+        c.check_credentials().await.unwrap();
+        c.account_auth_file_only = true;
+        assert!(c.check_credentials().await.is_err());
+    }
+}
